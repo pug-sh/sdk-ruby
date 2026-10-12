@@ -227,11 +227,15 @@ end
 
 ```ruby
 # config/initializers/pug.rb
-PUG = Pug::Client.new(api_key: Rails.application.credentials.pug_api_key, logger: Rails.logger)
-at_exit { PUG.close(timeout: 5) }
+unless ENV["SECRET_KEY_BASE_DUMMY"]
+  PUG = Pug::Client.new(api_key: Rails.application.credentials.pug_api_key, logger: Rails.logger)
+  at_exit { PUG.close(timeout: 5) }
+end
 ```
 
-The client is safe to create before Puma or Unicorn fork their workers.
+`Pug::Client.new` raises without an API key, so the guard skips it during the `assets:precompile`
+step of Rails' generated Dockerfile, which boots the app with `SECRET_KEY_BASE_DUMMY=1` and no
+credentials. The client is safe to create before Puma or Unicorn fork their workers.
 
 ## Contributing
 
