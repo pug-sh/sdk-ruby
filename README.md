@@ -38,7 +38,7 @@ pug.identify("user_42", email: "ada@example.com", plan: "pro")
 profile = pug.profiles.get_by_external_id("user_42")
 pug.profiles.list.each { |p| puts p.external_id }
 trend = pug.insights.query(
-  spec: insight_spec, # a Hash, or a Pug::Proto::Shared::Insights::V1::InsightQuerySpec
+  spec: { insight_type: :INSIGHT_TYPE_TRENDS, events: [{ event: { kind: "order.completed" } }] },
   time_range: { from: Time.now - (30 * 86_400), to: Time.now },
   granularity: :GRANULARITY_DAY,
 )
@@ -81,7 +81,7 @@ pug.close
 
 ```ruby
 Pug::Client.new(
-  api_key:,  # required, prv_…
+  api_key: ENV.fetch("PUG_API_KEY"),
   batch: { max_size: 100, max_wait: 5, max_queue_size: 10_000 },
   on_error: lambda do |error, events|
     # dead-letter sink: error is a Pug::QueueOverflowError, a Pug::ClosedError, a Pug::Error
@@ -119,9 +119,9 @@ in a Hash, braces optional, and options follow as keywords. Without braces, a ke
 option sets that option, so a property with an option's name needs the braces:
 
 ```ruby
-pug.track(user.id, "signup", plan: "pro")
-pug.track(user.id, "signup", plan: "pro", timestamp: signed_up_at)
-pug.track(user.id, "signup", { plan: "pro", location: "landing" }, location: { country: "DE" })
+pug.track("user_42", "signup", plan: "pro")
+pug.track("user_42", "signup", plan: "pro", timestamp: Time.now - 3600)
+pug.track("user_42", "signup", { plan: "pro", location: "landing" }, location: { country: "DE" })
 ```
 
 `track` options: `timestamp` (a `Time`; defaults to now), `session_id` (a UUID overriding the
@@ -172,7 +172,7 @@ Pug only derives geo from CDN headers on browser (public-key) requests. This SDK
 key, so the server adds no geo of its own — without `location`, an event has no geo at all:
 
 ```ruby
-pug.track("user-123", "checkout_completed", { plan: "pro" }, location: { country: "DE", city: "Berlin" })
+pug.track("user_42", "checkout_completed", { plan: "pro" }, location: { country: "DE", city: "Berlin" })
 ```
 
 Fields: `continent`, `country`, `region`, `city`, `postal_code`, `metro_code`, `timezone`,
@@ -206,9 +206,9 @@ sessions.sessions.each { |s| puts s.session_id }
 ```
 
 Reads leave out traffic tagged as a bot at ingest unless you ask for it: pass
-`include_bots: true` to `profiles.get` and `get_by_external_id`, or set it on the request of
-`profiles.list` or of an `activity` read other than `filter_schema` and `property_values`. The
-other requests have no such field.
+`include_bots: true` to `profiles.get` and `get_by_external_id`, set it on the request of
+`profiles.list` or of an `activity` read other than `filter_schema` and `property_values`, or set
+it on the `spec` of `insights.query`. The other requests have no such field.
 
 `Pug::Error#code` is the Connect code as a Symbol (`:not_found`, `:unavailable`, …), or `nil`
 when the failure didn't come from the RPC layer; `cause` is the underlying exception. The SDK
