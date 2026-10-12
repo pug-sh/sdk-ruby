@@ -23,10 +23,7 @@ Requires Ruby 3.3 or newer.
 ```ruby
 require "pug"
 
-pug = Pug::Client.new(
-  api_key: ENV.fetch("PUG_API_KEY"),
-  endpoint: "https://pug.example.com",
-)
+pug = Pug::Client.new(api_key: ENV.fetch("PUG_API_KEY"))
 
 # Track an event. distinct_id (who the event is for) comes first — a server has no ambient user.
 pug.track("user_42", "order.completed", amount: 49.0, currency: "USD")
