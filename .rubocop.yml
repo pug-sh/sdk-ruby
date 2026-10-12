@@ -1,0 +1,37 @@
+AllCops:
+  TargetRubyVersion: 3.3
+  NewCops: enable
+  SuggestExtensions: false
+  Exclude:
+    - lib/pug/gen/**/*
+    - vendor/**/*
+
+Layout/LineLength:
+  Max: 120
+
+# As in Standard Ruby: size limits flag long tables and test cases more than real complexity.
+Metrics:
+  Enabled: false
+
+# Bundler auto-requires a gem by its name, and this gem's name has a dash.
+Naming/FileName:
+  Exclude:
+    - lib/pug-sh.rb
+
+# int32, uint64 and friends are protobuf's names.
+Naming/VariableNumber:
+  Enabled: false
+
+Naming/PredicateMethod:
+  AllowedMethods:
+    - flush
+    - close
+
+Style/Documentation:
+  Enabled: false
+
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/StringLiteralsInInterpolation:
+  EnforcedStyle: double_quotes

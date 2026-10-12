@@ -1,0 +1,7 @@
+# Vendored, hermetic proto module. Source of truth is buf.build/pugsh/pug, exported
+# from the monorepo via `buf export` (see Makefile `sync-protos`). buf/validate and the
+# google well-known types are pulled in as transitive imports, so codegen runs offline
+# with no external module dependency. Mirrors sdk-node / sdk-go.
+version: v2
+modules:
+  - path: proto

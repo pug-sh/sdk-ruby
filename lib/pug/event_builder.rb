@@ -1,0 +1,503 @@
+# frozen_string_literal: true
+
+require "date"
+require "json"
+require "securerandom"
+require_relative "countries"
+require_relative "log"
+require_relative "proto"
+require_relative "validator"
+require_relative "version"
+require_relative "well_known"
+
+module Pug
+  # Builds and validates the Event for a track call. build returns [event, encoded bytesize],
+  # or nil, having logged why, when the event must be dropped.
+  class EventBuilder
+    LIB = "pug-ruby"
+    PLATFORM = "server"
+
+    # PropertyValue.string_value is capped at 1024 code points. A UTF-8 byte count is always at
+    # least the code-point count, so a 1024-byte cap is stricter, never looser.
+    MAX_STRING_BYTES = 1024
+
+    # The server refuses request bodies over 8 MiB with resource_exhausted, a transient code, so
+    # an event too big to fit a request would be retried forever. Half the cap leaves room for
+    # the request envelope.
+    MAX_EVENT_BYTES = 4 * 1024 * 1024
+
+    NANOS = 1_000_000_000
+    # Past 2^53 a Float may already have been rounded, so it can't stand for an exact integer.
+    MAX_SAFE_FLOAT = 2**53
+
+    INTEGER_RANGES = {
+      int32: (-(2**31))..((2**31) - 1),
+      sint32: (-(2**31))..((2**31) - 1),
+      sfixed32: (-(2**31))..((2**31) - 1),
+      int64: (-(2**63))..((2**63) - 1),
+      sint64: (-(2**63))..((2**63) - 1),
+      sfixed64: (-(2**63))..((2**63) - 1),
+      uint32: 0..((2**32) - 1),
+      fixed32: 0..((2**32) - 1),
+      uint64: 0..((2**64) - 1),
+      fixed64: 0..((2**64) - 1)
+    }.freeze
+
+    # Proto Timestamp tops out at year 9999. A time past it, or before the epoch, is almost
+    # certainly a unit mistake.
+    MIN_OCCUR_TIME = Time.at(0).utc
+    MAX_OCCUR_TIME = Time.utc(9999, 12, 31, 23, 59, 59)
+
+    LOCATION_STRINGS = {
+      "continent" => "$continent",
+      "country" => "$country",
+      "region" => "$region",
+      "city" => "$city",
+      "postal_code" => "$postalCode",
+      "metro_code" => "$metroCode",
+      "timezone" => "$timezone"
+    }.freeze
+    LOCATION_COORDINATES = { "latitude" => 90, "longitude" => 180 }.freeze
+    LOCATION_ALIASES = { "postalCode" => "postal_code", "metroCode" => "metro_code" }.freeze
+    LOCATION_FIELD_NAMES = (LOCATION_STRINGS.keys + LOCATION_COORDINATES.keys).join(", ")
+
+    Event = Proto::Sdk::Events::V1::Event
+    Duration = ::Google::Protobuf::Duration
+    Timestamp = ::Google::Protobuf::Timestamp
+
+    SchemaField = Struct.new(:descriptor, :name, :json_name, :type, :explicit)
+    Schema = Struct.new(:klass, :name, :by_key, :fields)
+
+    # Field lookups for every well-known schema, by proto name and JSON name, worked out once.
+    SCHEMAS = WellKnown::CATALOG.transform_values do |klass|
+      fields = klass.descriptor.map do |field|
+        SchemaField.new(field, field.name, field.json_name, field.type, field.has_presence?).freeze
+      end
+      by_key = fields.flat_map { |field| [[field.name, field], [field.json_name, field]] }.to_h
+      Schema.new(klass, klass.descriptor.name, by_key.freeze, fields.freeze).freeze
+    end.freeze
+
+    class FieldError < StandardError
+      attr_reader :field
+
+      def initialize(field, message)
+        @field = field
+        super(message)
+      end
+
+      def to_s
+        "#{field}: #{super}"
+      end
+    end
+
+    class NotRepresentable < StandardError; end
+
+    Unsupported = Object.new.freeze
+
+    def self.utf8(string)
+      unless [Encoding::UTF_8, Encoding::BINARY, Encoding::US_ASCII].include?(string.encoding)
+        string = string.encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: "\uFFFD")
+      end
+      string = string.dup.force_encoding(Encoding::UTF_8) unless string.encoding == Encoding::UTF_8
+      string.valid_encoding? ? string : string.scrub("\uFFFD")
+    end
+
+    def self.time?(value)
+      value.is_a?(Time) || value.is_a?(DateTime)
+    end
+
+    def self.real_number?(value)
+      value.is_a?(Numeric) && value.real?
+    end
+
+    def self.type_name(value)
+      value.nil? ? "nil" : value.class.name
+    end
+
+    # options.proto's wire form for a Duration: "1.5s", never "1.500s". Summing first fixes nanos
+    # that are out of range or signed against the seconds.
+    def self.format_duration(seconds, nanos)
+      total = (seconds * NANOS) + nanos
+      whole, fraction = total.abs.divmod(NANOS)
+      fraction = format("%09d", fraction).sub(/0+\z/, "")
+      "#{"-" if total.negative?}#{whole}#{".#{fraction}" unless fraction.empty?}s"
+    end
+
+    def initialize(log)
+      @log = log
+    end
+
+    def build(kind, session_id, distinct_id, properties = nil, timestamp: nil, location: nil)
+      kind = self.class.utf8(kind.to_s)
+      schema = SCHEMAS[kind]
+      custom = if schema
+                 well_known_properties(schema, kind, properties || {})
+               else
+                 custom_properties(properties || {}, kind)
+               end
+      return if custom.nil?
+
+      auto = {
+        "$lib" => string_value(LIB),
+        "$sdkVersion" => string_value(VERSION),
+        "$platform" => string_value(PLATFORM),
+        **location_properties(location, kind)
+      }
+      event = new_event(kind, session_id, distinct_id, auto, custom, timestamp)
+      return if event.nil?
+
+      violations = Validator.validate(event)
+      unless violations.empty?
+        @log.error("Event \"#{kind}\" (#{schema ? "well-known" : "custom"}) failed Event-level validation: " \
+                   "#{Validator.format(violations)}")
+        return
+      end
+      bytesize = Event.encode(event).bytesize
+      if bytesize > MAX_EVENT_BYTES
+        @log.error("Event \"#{kind}\" dropped: #{bytesize} bytes is too large to send (limit #{MAX_EVENT_BYTES})")
+        return
+      end
+      [event, bytesize]
+    end
+
+    private
+
+    def new_event(kind, session_id, distinct_id, auto, custom, timestamp)
+      Event.new(
+        event_id: SecureRandom.uuid_v7,
+        auto_properties: auto,
+        custom_properties: custom,
+        kind: kind,
+        session_id: session_id,
+        distinct_id: distinct_id,
+        occur_time: occur_time(timestamp)
+      )
+    rescue StandardError => e
+      @log.error("Event \"#{kind}\" dropped: failed to create Event proto: #{Log.describe(e)}")
+      nil
+    end
+
+    def occur_time(timestamp)
+      return Timestamp.from_time(Time.now) if timestamp.nil?
+
+      time = timestamp.to_time if self.class.time?(timestamp)
+      return Timestamp.new(seconds: time.to_i, nanos: time.nsec) if time&.between?(MIN_OCCUR_TIME, MAX_OCCUR_TIME)
+
+      @log.warn("Ignoring invalid track timestamp #{timestamp.inspect}; expected a Time between 1970 and 9999. " \
+                "Using current time.")
+      Timestamp.from_time(Time.now)
+    end
+
+    # Typed fields render by their proto type rather than their Ruby value, so a whole-number
+    # double stays a double. Keys may be the field's proto name or its JSON name; unknown keys
+    # ride along as custom properties.
+    def well_known_properties(schema, kind, properties)
+      message, extras = typed_message(schema, properties)
+      violations = Validator.validate(message)
+      unless violations.empty?
+        @log.error("Event \"#{kind}\" dropped: properties validation failed for \"#{schema.name}\": " \
+                   "#{Validator.format(violations)}")
+        return
+      end
+      known_properties(schema, message).merge(custom_properties(extras, kind))
+    rescue FieldError => e
+      @log.error("Event \"#{kind}\" dropped: invalid properties for \"#{schema.name}\": #{e}")
+      nil
+    end
+
+    def typed_message(schema, properties)
+      given = {}
+      extras = {}
+      properties.each do |key, value|
+        name = self.class.utf8(key.to_s)
+        field = schema.by_key[name]
+        if field.nil?
+          extras[name] = value
+        elsif given.key?(field)
+          raise FieldError.new(field.name, "given twice, as #{given[field].first} and #{name}")
+        else
+          given[field] = [name, value]
+        end
+      end
+      init = given.each_with_object({}) do |(field, (_, value)), out|
+        next if value.nil?
+
+        coerced = coerce(field.descriptor, value)
+        out[field.name] = coerced unless coerced.equal?(Unsupported)
+      end
+      [build_message(schema.klass, init), extras]
+    end
+
+    def build_message(klass, init)
+      klass.new(init)
+    rescue ArgumentError, TypeError, RangeError, ::Google::Protobuf::TypeError => e
+      raise FieldError.new(init.keys.join(", "), e.message)
+    end
+
+    # Ruby's protobuf type-checks assignments too, but coercing first keeps the messages uniform
+    # and decides the Ruby-specific cases: a Symbol is a string, an integral Float is an integer.
+    def coerce(field, value)
+      return unsupported(field) if field.label == :repeated
+
+      case field.type
+      when :string
+        return self.class.utf8(value.to_s) if value.is_a?(String) || value.is_a?(Symbol)
+
+        raise FieldError.new(field.name, "expected string, got #{self.class.type_name(value)}")
+      when :bool
+        return value if [true, false].include?(value)
+
+        raise FieldError.new(field.name, "expected bool, got #{self.class.type_name(value)}")
+      when :double, :float
+        return Float(value) if self.class.real_number?(value)
+
+        raise FieldError.new(field.name, "expected #{field.type}, got #{self.class.type_name(value)}")
+      when *INTEGER_RANGES.keys
+        integer(field.name, field.type, value)
+      when :message
+        return duration(field.name, value) if field.subtype.name == "google.protobuf.Duration"
+
+        unsupported(field)
+      else
+        unsupported(field)
+      end
+    end
+
+    def unsupported(field)
+      @log.warn("Field \"#{field.name}\" has unsupported type #{field.subtype&.name || field.type}, skipping")
+      Unsupported
+    end
+
+    def integer(name, type, value)
+      number = case value
+               when Integer then value
+               when Float then integral_float(name, type, value)
+               else
+                 unless self.class.real_number?(value) && value.finite? && value == value.truncate
+                   raise FieldError.new(name, "expected #{type}, got #{self.class.type_name(value)}")
+                 end
+
+                 value.to_i
+               end
+      return number if INTEGER_RANGES.fetch(type).cover?(number)
+
+      raise FieldError.new(name, "expected #{type}, got #{number}")
+    end
+
+    def integral_float(name, type, value)
+      raise FieldError.new(name, "expected #{type}, got #{value}") unless value.finite? && value == value.truncate
+      raise FieldError.new(name, "expected a safe integer, got #{value}") if value.abs >= MAX_SAFE_FLOAT
+
+      value.to_i
+    end
+
+    # A Numeric is seconds, Ruby's unit for time spans (and what google-protobuf itself accepts
+    # for a Duration field).
+    def duration(name, value)
+      case value
+      when Duration then value
+      when Hash then duration_from_hash(name, value)
+      else
+        unless self.class.real_number?(value)
+          raise FieldError.new(name, "expected a Duration (seconds, { seconds:, nanos: } or " \
+                                     "Google::Protobuf::Duration), got #{self.class.type_name(value)}")
+        end
+        raise FieldError.new(name, "expected a finite number of seconds, got #{value}") unless value.finite?
+
+        total = (Rational(value) * NANOS).round
+        seconds, nanos = total.abs.divmod(NANOS)
+        sign = total.negative? ? -1 : 1
+        Duration.new(seconds: sign * seconds, nanos: sign * nanos)
+      end
+    end
+
+    def duration_from_hash(name, value)
+      parts = value.transform_keys(&:to_s)
+      unless (parts.keys - %w[seconds nanos]).empty?
+        raise FieldError.new(name, "expected a Duration ({ seconds:, nanos: }), got keys #{parts.keys.join(", ")}")
+      end
+
+      Duration.new(
+        seconds: parts["seconds"].nil? ? 0 : integer("seconds", :int64, parts["seconds"]),
+        nanos: parts["nanos"].nil? ? 0 : integer("nanos", :int32, parts["nanos"])
+      )
+    rescue FieldError => e
+      raise FieldError.new(name, e.to_s)
+    end
+
+    def known_properties(schema, message)
+      schema.fields.each_with_object({}) do |field, out|
+        next if field.descriptor.label == :repeated
+
+        value = field.descriptor.get(message)
+        next unless field.explicit ? field.descriptor.has?(message) : value != field.descriptor.default
+
+        property = known_value(field, value)
+        if property
+          out[field.json_name] = property
+        else
+          @log.warn("Field \"#{schema.name}.#{field.name}\" has unsupported type #{field.type}, skipping")
+        end
+      end
+    end
+
+    def known_value(field, value)
+      case field.type
+      when :string then string_value(value)
+      when :bool then { bool_value: value }
+      when :double, :float then { double_value: value }
+      when *INTEGER_RANGES.keys
+        { int_value: value } if INTEGER_RANGES[:int64].cover?(value)
+      when :message
+        string_value(self.class.format_duration(value.seconds, value.nanos)) if value.is_a?(Duration)
+      end
+    end
+
+    def custom_properties(properties, kind)
+      properties.each_with_object({}) do |(key, value), out|
+        mapped = custom_value(value)
+        out[self.class.utf8(key.to_s)] = mapped if mapped
+      rescue NotRepresentable => e
+        @log.warn("Property \"#{key}\" on event \"#{kind}\" not representable (#{e.message}), skipping")
+      end
+    end
+
+    # A nil result means the value is absent and the property is omitted.
+    def custom_value(value)
+      case value
+      when nil then nil
+      when String, Symbol then string_value(value.to_s)
+      when true, false then { bool_value: value }
+      when Integer
+        raise NotRepresentable, "#{value} overflows int64" unless INTEGER_RANGES[:int64].cover?(value)
+
+        { int_value: value }
+      when Float then double_value(value)
+      when Timestamp then { timestamp_value: value }
+      when Duration then string_value(self.class.format_duration(value.seconds, value.nanos))
+      when Hash, Array then json_value(value)
+      else other_value(value)
+      end
+    end
+
+    def other_value(value)
+      if self.class.time?(value)
+        time = value.to_time
+        raise NotRepresentable, "#{value} is out of the timestamp range" unless time.getutc.year.between?(1, 9999)
+
+        { timestamp_value: Timestamp.new(seconds: time.to_i, nanos: time.nsec) }
+      elsif value.is_a?(Date)
+        string_value(value.iso8601)
+      elsif self.class.real_number?(value)
+        double_value(Float(value))
+      else
+        raise NotRepresentable, "unsupported type #{self.class.type_name(value)}"
+      end
+    end
+
+    def double_value(value)
+      raise NotRepresentable, "non-finite number #{value}" unless value.finite?
+
+      { double_value: value }
+    end
+
+    def json_value(value)
+      string_value(JSON.generate(value))
+    rescue StandardError => e
+      raise NotRepresentable, "not JSON-serializable: #{e.message}"
+    end
+
+    def string_value(raw)
+      value = self.class.utf8(raw)
+      if value.bytesize > MAX_STRING_BYTES
+        @log.warn("Property string exceeds #{MAX_STRING_BYTES} bytes, truncating")
+        value = value.byteslice(0, MAX_STRING_BYTES).scrub("")
+      end
+      { string_value: value }
+    end
+
+    # The server skips geo enrichment on private-key requests, which is all this SDK makes, so
+    # these keys are the only geo the event will ever carry: a dropped field is a permanent hole,
+    # not one filled in later.
+    def location_properties(location, kind)
+      return {} if location.nil?
+
+      unless location.is_a?(Hash)
+        @log.warn("Ignoring location on event \"#{kind}\": expected a Hash, got #{self.class.type_name(location)}")
+        return {}
+      end
+      fields = location_fields(location, kind)
+      props = location_strings(fields, kind).merge(location_coordinates(fields, kind))
+      @log.warn("Ignoring location on event \"#{kind}\": no usable fields; the event will carry no geo") if props.empty?
+      props
+    end
+
+    def location_fields(location, kind)
+      location.each_with_object({}) do |(key, value), fields|
+        name = LOCATION_ALIASES.fetch(key.to_s, key.to_s)
+        if !LOCATION_STRINGS.key?(name) && !LOCATION_COORDINATES.key?(name)
+          @log.warn("Ignoring unknown location field \"#{key}\" on event \"#{kind}\"; expected one of " \
+                    "#{LOCATION_FIELD_NAMES}")
+        elsif fields.key?(name)
+          @log.warn("Ignoring location field \"#{key}\" on event \"#{kind}\": #{name} is already set")
+        else
+          fields[name] = value
+        end
+      end
+    end
+
+    def location_strings(fields, kind)
+      LOCATION_STRINGS.each_with_object({}) do |(name, property), props|
+        value = fields[name]
+        next if value.nil?
+
+        unless value.is_a?(String) || value.is_a?(Symbol)
+          @log.warn("Ignoring location.#{name} on event \"#{kind}\": expected a String, got " \
+                    "#{self.class.type_name(value)}")
+          next
+        end
+        trimmed = self.class.utf8(value.to_s).gsub(/\A[[:space:]]+|[[:space:]]+\z/, "")
+        next if trimmed.empty?
+
+        if name == "country"
+          trimmed = trimmed.upcase
+          unless COUNTRY_CODES.include?(trimmed)
+            @log.warn("Ignoring location.country #{value.to_s.inspect} on event \"#{kind}\"; expected an " \
+                      "ISO 3166-1 alpha-2 code like \"DE\"")
+            next
+          end
+        end
+        props[property] = string_value(trimmed)
+      end
+    end
+
+    # Always doubles: a whole-number coordinate in the int slot would split the column every
+    # other writer of $latitude/$longitude files as Float64. A lone coordinate reads as a real
+    # position with the other axis at 0, so they are sent together or not at all.
+    def location_coordinates(fields, kind)
+      coordinates = LOCATION_COORDINATES.each_with_object({}) do |(name, limit), found|
+        value = fields[name]
+        next if value.nil?
+
+        unless self.class.real_number?(value)
+          @log.warn("Ignoring location.#{name} on event \"#{kind}\": expected a number, got " \
+                    "#{self.class.type_name(value)}")
+          next
+        end
+        number = Float(value)
+        unless number.finite? && number.abs <= limit
+          @log.warn("Ignoring location.#{name} #{value} on event \"#{kind}\"; expected a number within ±#{limit}")
+          next
+        end
+        found[name] = number
+      end
+      if coordinates.size == 1
+        @log.warn("Ignoring location coordinates on event \"#{kind}\": latitude and longitude must be set together")
+      end
+      return {} unless coordinates.size == 2
+
+      { "$latitude" => { double_value: coordinates["latitude"] },
+        "$longitude" => { double_value: coordinates["longitude"] } }
+    end
+  end
+end

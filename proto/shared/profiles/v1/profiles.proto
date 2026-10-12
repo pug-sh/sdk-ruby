@@ -1,0 +1,171 @@
+edition = "2023";
+package shared.profiles.v1;
+
+import "buf/validate/validate.proto";
+import "common/v1/filters.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/pug-sh/pug/internal/gen/proto/shared/profiles/v1;profilesv1";
+
+service ProfilesService {
+  // Get returns a single user profile by its pug profile id, including identity
+  // properties and an activity summary. A claimed anonymous id is redirected to
+  // its canonical profile.
+  // Traffic tagged as a bot at ingest is excluded from the activity summary
+  // unless include_bots is true.
+  rpc Get(GetRequest) returns (GetResponse) {}
+  // GetByExternalId returns a single user profile looked up by the external_id your
+  // application assigned to its end user, rather than by pug's internal profile id.
+  // Traffic tagged as a bot at ingest is excluded from the activity summary
+  // unless include_bots is true.
+  rpc GetByExternalId(GetByExternalIdRequest) returns (GetByExternalIdResponse) {}
+  // List returns a page of user profiles for the project. Server-streaming, so it
+  // is not exposed as an MCP tool. Derived anonymous persons whose traffic is all
+  // bot-tagged are omitted unless include_bots is true; an identified profile is
+  // always listed, with bot-tagged events left out of its activity summary.
+  rpc List(ListRequest) returns (stream ListResponse) {}
+  // Delete erases a data subject identified by profile id. Like
+  // DeleteDataSubject, it enqueues asynchronous hard erasure that reaches the
+  // events table and every derived rollup; the profile is soft-deleted
+  // synchronously in PostgreSQL and physically removed from every store by the
+  // compliance worker.
+  rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+  // DeleteDataSubject erases a data subject identified by external_id (the
+  // controller-facing handle). Proceeds even when no profile row exists, since
+  // events can be keyed directly by external_id.
+  rpc DeleteDataSubject(DeleteDataSubjectRequest) returns (DeleteDataSubjectResponse) {}
+  // GetDeletionRequest returns the status of an erasure request so a controller
+  // can prove fulfilment within the statutory window (the DSAR audit trail).
+  rpc GetDeletionRequest(GetDeletionRequestRequest) returns (GetDeletionRequestResponse) {}
+}
+
+// ComplianceRequestStatus is the lifecycle of a compliance (DSAR) request. It
+// mirrors the compliance_requests.status CHECK constraint and the
+// core/profiles.ComplianceStatus constants.
+enum ComplianceRequestStatus {
+  COMPLIANCE_REQUEST_STATUS_UNSPECIFIED = 0;
+  COMPLIANCE_REQUEST_STATUS_PENDING = 1;
+  COMPLIANCE_REQUEST_STATUS_PROCESSING = 2;
+  COMPLIANCE_REQUEST_STATUS_COMPLETED = 3;
+  COMPLIANCE_REQUEST_STATUS_FAILED = 4;
+}
+
+message DeleteRequest {
+  string id = 1 [(buf.validate.field).required = true];
+}
+
+message DeleteDataSubjectRequest {
+  string external_id = 1 [(buf.validate.field).required = true];
+}
+
+// DeleteResponse and DeleteDataSubjectResponse are kept as distinct types (not a
+// shared message) to satisfy buf's RPC_REQUEST_RESPONSE_UNIQUE rule, which lets
+// each erasure RPC evolve its response independently.
+message DeleteResponse {
+  // ID of the recorded erasure request; pass to GetDeletionRequest to track completion.
+  string request_id = 1;
+  ComplianceRequestStatus status = 2;
+}
+
+message DeleteDataSubjectResponse {
+  string request_id = 1;
+  ComplianceRequestStatus status = 2;
+}
+
+message GetDeletionRequestRequest {
+  string request_id = 1 [(buf.validate.field).required = true];
+}
+
+message GetDeletionRequestResponse {
+  string request_id = 1;
+  string external_id = 2;
+  string profile_id = 3;
+  ComplianceRequestStatus status = 4;
+  // Number of event rows identified for erasure when the request was frozen
+  // (counted just before the deletes run, not reconciled to rows physically
+  // removed). Projects the compliance_requests.events_affected column, named
+  // generically because the same ledger serves export.
+  int64 events_identified = 5;
+  google.protobuf.Timestamp requested_at = 6;
+  google.protobuf.Timestamp completed_at = 7;
+  // Failure reason when status is FAILED (the compliance_requests.error column);
+  // empty otherwise.
+  string error = 8;
+}
+
+message GetByExternalIdRequest {
+  string external_id = 1 [(buf.validate.field).required = true];
+  // Optional. Traffic tagged as automated at ingest ($bot: crawler user agents
+  // and datacenter networks) is EXCLUDED by default. Set true to include bots.
+  bool include_bots = 2;
+}
+
+message GetByExternalIdResponse {
+  Profile profile = 1;
+}
+
+message GetRequest {
+  string id = 1 [(buf.validate.field).required = true];
+  // Optional. Traffic tagged as automated at ingest ($bot: crawler user agents
+  // and datacenter networks) is EXCLUDED by default. Set true to include bots.
+  bool include_bots = 2;
+}
+
+message GetResponse {
+  Profile profile = 1;
+}
+
+message FilterGroup {
+  repeated common.v1.PropertyFilter filters = 1 [(buf.validate.field).repeated.min_items = 1];
+  common.v1.LogicalOperator operator = 2;
+}
+
+message ListRequest {
+  // Opaque cursor from a previous response's next_page_token. Empty for the first page.
+  string page_token = 1;
+  repeated FilterGroup filter_groups = 2;
+  common.v1.LogicalOperator filter_groups_operator = 3;
+  // Optional. Traffic tagged as automated at ingest ($bot: crawler user agents
+  // and datacenter networks) is EXCLUDED by default. Set true to include bots.
+  // A derived anonymous person's create_time — the sort and cursor key — is
+  // computed after this filter, so changing it mid-pagination skips rows. Keep it
+  // constant for a page_token run and restart from an empty token to flip it.
+  bool include_bots = 4;
+}
+
+message ListResponse {
+  repeated Profile profiles = 1;
+  // Empty when there are no more pages.
+  string next_page_token = 2;
+}
+
+message ProfileActivitySummary {
+  google.protobuf.Timestamp first_seen = 1;
+  google.protobuf.Timestamp last_seen = 2;
+  int64 total_events = 3;
+  int64 pageviews = 4;
+  int64 sessions = 5;
+  string browser = 6;
+  string browser_version = 7;
+  string os = 8;
+  string os_version = 9;
+  string device = 10;
+  string country = 11;
+  string region = 12;
+  string city = 13;
+  // True when EVERY event counted in this summary was tagged as automated at
+  // ingest ($bot) — a crawler, not a user with one tagged event. Only ever true
+  // on a read that set include_bots, since bot traffic is otherwise excluded.
+  bool bot = 14;
+}
+
+message Profile {
+  google.protobuf.Timestamp create_time = 1;
+  string external_id = 2;
+  string id = 3;
+  google.protobuf.Struct properties = 4;
+  string project_id = 5;
+  google.protobuf.Timestamp update_time = 6;
+  ProfileActivitySummary activity = 7;
+}

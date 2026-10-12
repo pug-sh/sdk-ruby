@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Lint, codegen & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      # buf-setup publishes no moving major tag, so this is pinned exactly. It resolves the
+      # download URL through the GitHub API even for a pinned buf version, and unauthenticated
+      # runners share a 60/hr limit — hence the token.
+      - uses: bufbuild/buf-setup-action@v1.50.0
+        with:
+          version: 1.73.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # lib/pug/gen is protoc's built-in Ruby output, so it only regenerates byte for byte with
+      # the protoc the Makefile pins.
+      - name: Install protoc
+        run: |
+          version=$(sed -n 's/^PROTOC_VERSION *:= *//p' Makefile)
+          curl -fsSL -o protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${version}/protoc-${version}-linux-x86_64.zip"
+          sudo unzip -q -o protoc.zip -d /usr/local bin/protoc 'include/*'
+          rm protoc.zip
+
+      - run: make ci
+
+      - name: Check for uncommitted changes
+        run: git diff --exit-code
+
+  test:
+    name: Test (Ruby ${{ matrix.ruby }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.3", "3.4", "4.0"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+
+      - run: bundle exec rake test

@@ -1,0 +1,19 @@
+# Bundler
+/.bundle/
+/vendor/bundle/
+
+# Build output
+*.gem
+/pkg/
+
+# Test and coverage output
+/coverage/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local secrets
+.env
+.env.*

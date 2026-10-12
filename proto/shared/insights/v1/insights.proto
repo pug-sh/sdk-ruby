@@ -1,0 +1,979 @@
+edition = "2023";
+package shared.insights.v1;
+
+import "buf/validate/validate.proto";
+import "common/v1/filter_schema.proto";
+import "common/v1/filters.proto";
+import "common/v1/time.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/pug-sh/pug/internal/gen/proto/shared/insights/v1;insightsv1";
+
+service InsightsService {
+  // Query runs a product-analytics insight over the project's events and returns
+  // the computed result. A single call covers every insight type — trends,
+  // segmentation, funnel, retention, user flow (Sankey), top-K and map (a metric
+  // per country, returned as top_k rows keyed by ISO alpha-2) — chosen by the
+  // InsightQuerySpec (its insight_type, events, breakdowns and filters, among
+  // others). Map, user flow, top-K and session each carry their own sub-message
+  // (spec.map / spec.user_flow / spec.top_k / spec.session) and take no events or
+  // breakdowns; a map's country dimension is implicit, so spec.map may be empty.
+  // The request also carries the time range and granularity, and it is the
+  // right tool for any project-wide or over-time question; per-granularity range
+  // caps apply. Traffic tagged as a bot at ingest is excluded unless
+  // spec.include_bots is true.
+  // Discover valid event kinds and property keys with the get_insights_filter_schema tool first.
+  rpc Query(QueryRequest) returns (QueryResponse);
+  // SegmentUsers returns a paginated page of the distinct ids of the users who
+  // performed a given set of events (with optional filters) in a time range — the
+  // "who" behind a number on a chart. Not exposed as an MCP tool while the
+  // drill-down insight is still WIP; see toolPolicy in
+  // internal/app/server/mcp/rename.go.
+  rpc SegmentUsers(SegmentUsersRequest) returns (SegmentUsersResponse);
+  // GetFilterSchema lists the event kinds and the property keys/types available to
+  // filter and break down by. Call it before query_insights so that filters and
+  // breakdowns reference keys that actually exist in this project.
+  //
+  // The filter-schema concept is service-agnostic; both shared.insights and
+  // shared.activity expose the same shape via common.v1.
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc GetFilterSchema(common.v1.GetFilterSchemaRequest) returns (common.v1.GetFilterSchemaResponse);
+  // GetPropertyValues lists the observed values of an event or user property
+  // (e.g. the countries seen for "$country") so filters and breakdowns can be
+  // populated with real values before running query_insights.
+  rpc GetPropertyValues(GetPropertyValuesRequest) returns (GetPropertyValuesResponse);
+}
+
+message InsightQuerySpec {
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.funnel_retention_require_events"
+    message: "funnel and retention insight types require at least one event"
+    expression:
+      "(this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_FUNNEL"
+      "&& this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_RETENTION)"
+      "|| this.events.size() > 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.funnel_only_conversion_window"
+    message: "conversion_window is only valid for funnel insight type"
+    expression:
+      "this.insight_type == shared.insights.v1.InsightType.INSIGHT_TYPE_FUNNEL"
+      "|| !has(this.conversion_window)"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.funnel_only_step_timing"
+    message: "include_step_timing is only valid for funnel insight type"
+    expression:
+      "this.insight_type == shared.insights.v1.InsightType.INSIGHT_TYPE_FUNNEL"
+      "|| !this.include_step_timing"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.session_only_trends_segmentation"
+    message: "session is only valid for trends and segmentation insight types"
+    expression:
+      "!has(this.session) || this.insight_type in ["
+      "  shared.insights.v1.InsightType.INSIGHT_TYPE_TRENDS,"
+      "  shared.insights.v1.InsightType.INSIGHT_TYPE_SEGMENTATION"
+      "]"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.session_no_events"
+    message: "session insights cannot also specify events"
+    expression: "!has(this.session) || this.events.size() == 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.session_page_metrics_require_trends_breakdown"
+    message: "session entry and exit metrics require trends with exactly one breakdown"
+    expression:
+      "!has(this.session)"
+      "|| !(this.session.metric in ["
+      "  shared.insights.v1.SessionMetric.SESSION_METRIC_ENTRY,"
+      "  shared.insights.v1.SessionMetric.SESSION_METRIC_EXIT"
+      "])"
+      "|| (this.insight_type == shared.insights.v1.InsightType.INSIGHT_TYPE_TRENDS"
+      "    && this.breakdowns.size() == 1)"
+  };
+
+  // Breakdowns are supported for trends, funnel, and retention.
+  // Segmentation ignores them — reject at the boundary instead.
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.segmentation_no_breakdowns"
+    message: "breakdowns are not supported for segmentation insight type"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_SEGMENTATION"
+      "|| this.breakdowns.size() == 0"
+  };
+
+  // Duplicate breakdown properties produce silently wrong aggregation.
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.unique_breakdown_properties"
+    message: "breakdown properties must be unique"
+    expression:
+      "this.breakdowns.size() <= 1"
+      "|| !this.breakdowns.exists(b,"
+      "     this.breakdowns.filter(x, x.property == b.property).size() > 1)"
+  };
+
+  // breakdown_limit without breakdowns is a no-op — likely a client mistake.
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.breakdown_limit_requires_breakdowns"
+    message: "breakdown_limit requires at least one breakdown"
+    expression: "this.breakdown_limit == 0 || this.breakdowns.size() > 0"
+  };
+
+  // Retention uses events[0] as start event and events[1] as return event.
+  // Additional events are silently ignored — cap at 2 to surface the mistake.
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.retention_max_events"
+    message: "retention supports at most 2 events (start event and optional return event)"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_RETENTION"
+      "|| this.events.size() <= 2"
+  };
+
+  // Cap funnel steps to bound query cost — applies to both `windowFunnel()` (counts) and
+  // the array-based timing path (per-user array sizes and one StepTiming per non-entry step).
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.funnel_max_steps"
+    message: "funnel supports at most 20 steps"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_FUNNEL"
+      "|| this.events.size() <= 20"
+  };
+
+  // SUM/AVG/MIN/MAX are only meaningful for trends and segmentation.
+  // Funnel and retention builders ignore the aggregation field, so reject early.
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.numeric_agg_only_trends_segmentation"
+    message: "SUM/AVG/MIN/MAX aggregation types are only supported for trends and segmentation"
+    expression:
+      "this.insight_type in ["
+      "  shared.insights.v1.InsightType.INSIGHT_TYPE_TRENDS,"
+      "  shared.insights.v1.InsightType.INSIGHT_TYPE_SEGMENTATION"
+      "] || this.events.all(e,"
+      "  !(e.aggregation in ["
+      "    shared.insights.v1.AggregationType.AGGREGATION_TYPE_SUM,"
+      "    shared.insights.v1.AggregationType.AGGREGATION_TYPE_AVG,"
+      "    shared.insights.v1.AggregationType.AGGREGATION_TYPE_MIN,"
+      "    shared.insights.v1.AggregationType.AGGREGATION_TYPE_MAX"
+      "  ]))"
+  };
+
+  InsightType insight_type = 1 [(buf.validate.field) = {
+    required: true
+    enum: {defined_only: true, not_in: [0]}
+  }];
+  repeated EventQuery events = 2;
+  repeated Breakdown breakdowns = 3 [(buf.validate.field).repeated.max_items = 5];
+  int32 breakdown_limit = 4 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 100
+  }];
+
+  // Optional grouped filters for top-level conditions.
+  // Each group combines its filters via group.operator.
+  // Groups are combined via filter_groups_operator.
+  repeated FilterGroup filter_groups = 5;
+  common.v1.LogicalOperator filter_groups_operator = 6;
+
+  // Funnel conversion window. Only used for INSIGHT_TYPE_FUNNEL.
+  // The maximum time allowed from the first step to the last step per user.
+  // Absent means use the full time range as the window (no constraint).
+  // Must be a whole-second value of at least 1 second — windowFunnel only accepts
+  // integer-second windows, so sub-second precision would be silently truncated.
+  google.protobuf.Duration conversion_window = 7 [
+    (buf.validate.field).duration.gte = {seconds: 1},
+    (buf.validate.field).cel = {
+      id: "conversion_window.whole_seconds"
+      message: "conversion_window must be a whole-second value (windowFunnel only accepts integer seconds)"
+      expression: "this == duration(string(this.getSeconds()) + 's')"
+    }
+  ];
+
+  // When true, funnel queries include per-step conversion-time statistics:
+  // average, median, p95, and an 8-bucket distribution histogram.
+  // Uses an array-based single-scan query that captures per-step timestamps,
+  // then computes timing in Go. When false (default), uses windowFunnel() for faster counts only.
+  bool include_step_timing = 8;
+
+  // Session-level metric. When present, events must be empty and the existing
+  // insight_type decides the response shape: TRENDS returns a time series,
+  // SEGMENTATION returns a scalar. ENTRY and EXIT additionally require TRENDS
+  // with exactly one breakdown (they bucket sessions by an entry/exit attribute);
+  // SESSIONS, AVG_DURATION, and BOUNCE_RATE work with either insight_type and
+  // any breakdown count. Each session is measured over its full set of (scoped)
+  // events and attributed to its start instant — the time window selects sessions
+  // by start time, it does not clip a session's events.
+  SessionQuery session = 9;
+
+  // User-flow graph query. Only valid when insight_type == USER_FLOW.
+  UserFlowQuery user_flow = 10;
+
+  // Top-K ranking query. Only valid when insight_type == TOP_K.
+  TopKQuery top_k = 11;
+
+  // Cookieless (no-consent) visitors carry server-derived ids that rotate
+  // daily, so one returning human counts as a new user every day. By default
+  // they are EXCLUDED from user-counting metrics (UNIQUE_USERS and
+  // PER_USER_AVG, numerator and denominator alike, wherever those metrics
+  // appear — trends, segmentation, top K) and from person-based insights
+  // (funnel, retention, user flow, and USER-dimension top K — these resolve
+  // people rather than events, so they exclude regardless of which metric is
+  // selected). Set true to include them. Event totals, numeric aggregations,
+  // and all session metrics always count all traffic regardless of this flag.
+  bool include_cookieless = 12;
+
+  // Country-choropleth query. Only valid when insight_type == MAP.
+  MapQuery map = 13;
+
+  // Traffic tagged as automated at ingest ($bot: crawler user agents and
+  // datacenter networks) is EXCLUDED by default from every insight and every
+  // metric. Session metrics and user flow judge a session whole: one tagged
+  // event excludes the session. Set true to include bots.
+  bool include_bots = 14;
+
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.user_flow_only_for_user_flow"
+    message: "user_flow is only valid for user flow insight type"
+    expression:
+      "!has(this.user_flow)"
+      "|| this.insight_type == shared.insights.v1.InsightType.INSIGHT_TYPE_USER_FLOW"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.user_flow_required"
+    message: "user flow insight type requires user_flow"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_USER_FLOW"
+      "|| has(this.user_flow)"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.user_flow_no_events"
+    message: "user flow insights cannot specify events"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_USER_FLOW"
+      "|| this.events.size() == 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.user_flow_no_session"
+    message: "user flow insights cannot specify session"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_USER_FLOW"
+      "|| !has(this.session)"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.user_flow_no_breakdowns"
+    message: "breakdowns are not supported for user flow insight type"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_USER_FLOW"
+      "|| this.breakdowns.size() == 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.user_flow_no_breakdown_limit"
+    message: "breakdown_limit is not supported for user flow insight type"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_USER_FLOW"
+      "|| this.breakdown_limit == 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.user_flow_property_required"
+    message: "node_property is required when node_kind is PROPERTY"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_USER_FLOW"
+      "|| this.user_flow.node_kind"
+      "   != shared.insights.v1.UserFlowQuery.NodeKind.NODE_KIND_PROPERTY"
+      "|| (this.user_flow.node_property.size() > 0"
+      "    && this.user_flow.node_property.matches('^\\\\$?[a-zA-Z0-9_.-]+$'))"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.user_flow_max_hops_range"
+    message: "max_hops must be between 1 and 10 when set"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_USER_FLOW"
+      "|| this.user_flow.max_hops == 0"
+      "|| (this.user_flow.max_hops >= 1 && this.user_flow.max_hops <= 10)"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.user_flow_max_nodes_range"
+    message: "max_nodes must be between 2 and 50 when set"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_USER_FLOW"
+      "|| this.user_flow.max_nodes == 0"
+      "|| (this.user_flow.max_nodes >= 2 && this.user_flow.max_nodes <= 50)"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.user_flow_max_links_range"
+    message: "max_links must be between 1 and 500 when set"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_USER_FLOW"
+      "|| this.user_flow.max_links == 0"
+      "|| (this.user_flow.max_links >= 1 && this.user_flow.max_links <= 500)"
+  };
+
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.top_k_only_for_top_k"
+    message: "top_k is only valid for top k insight type"
+    expression:
+      "!has(this.top_k)"
+      "|| this.insight_type == shared.insights.v1.InsightType.INSIGHT_TYPE_TOP_K"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.top_k_required"
+    message: "top k insight type requires top_k"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_TOP_K"
+      "|| has(this.top_k)"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.top_k_no_events"
+    message: "top k insights cannot specify events"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_TOP_K"
+      "|| this.events.size() == 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.top_k_no_session"
+    message: "top k insights cannot specify session"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_TOP_K"
+      "|| !has(this.session)"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.top_k_no_breakdowns"
+    message: "breakdowns are not supported for top k insight type"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_TOP_K"
+      "|| this.breakdowns.size() == 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.top_k_no_breakdown_limit"
+    message: "breakdown_limit is not supported for top k insight type"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_TOP_K"
+      "|| this.breakdown_limit == 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.top_k_property_required"
+    message: "property is required when dimension is PROPERTY"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_TOP_K"
+      "|| this.top_k.dimension"
+      "   != shared.insights.v1.TopKQuery.Dimension.DIMENSION_PROPERTY"
+      "|| (this.top_k.property.size() > 0"
+      "    && this.top_k.property.matches('^\\\\$?[a-zA-Z0-9_.-]+$'))"
+  };
+  // property with a non-PROPERTY dimension is rejected — likely a client mistake.
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.top_k_property_only_for_property_dimension"
+    message: "property is only valid when dimension is PROPERTY"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_TOP_K"
+      "|| this.top_k.dimension"
+      "   == shared.insights.v1.TopKQuery.Dimension.DIMENSION_PROPERTY"
+      "|| this.top_k.property == ''"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.top_k_metric_property_required"
+    message: "metric_property is required for SUM, AVG, MIN, and MAX metrics"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_TOP_K"
+      "|| !(this.top_k.metric in ["
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_SUM,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_AVG,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_MIN,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_MAX"
+      "]) || this.top_k.metric_property != ''"
+  };
+  // Each USER-dimension group is a single user, so per-user metrics are degenerate:
+  // UNIQUE_USERS is constant 1 and PER_USER_AVG collapses to TOTAL.
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.top_k_user_dimension_metric"
+    message: "UNIQUE_USERS and PER_USER_AVG metrics are not supported for the USER dimension"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_TOP_K"
+      "|| this.top_k.dimension != shared.insights.v1.TopKQuery.Dimension.DIMENSION_USER"
+      "|| !(this.top_k.metric in ["
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_UNIQUE_USERS,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_PER_USER_AVG"
+      "])"
+  };
+
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.map_only_for_map"
+    message: "map is only valid for map insight type"
+    expression:
+      "!has(this.map)"
+      "|| this.insight_type == shared.insights.v1.InsightType.INSIGHT_TYPE_MAP"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.map_required"
+    message: "map insight type requires map"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_MAP"
+      "|| has(this.map)"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.map_no_events"
+    message: "map insights cannot specify events"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_MAP"
+      "|| this.events.size() == 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.map_no_session"
+    message: "map insights cannot specify session"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_MAP"
+      "|| !has(this.session)"
+  };
+  // The country dimension is implied by the insight type, so there is nothing to
+  // break down by — and no top-N to bound. Every country with traffic is returned.
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.map_no_breakdowns"
+    message: "breakdowns are not supported for map insight type"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_MAP"
+      "|| this.breakdowns.size() == 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.map_no_breakdown_limit"
+    message: "breakdown_limit is not supported for map insight type"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_MAP"
+      "|| this.breakdown_limit == 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.map_metric_property_required"
+    message: "metric_property is required for SUM, AVG, MIN, and MAX metrics"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_MAP"
+      "|| !(this.map.metric in ["
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_SUM,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_AVG,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_MIN,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_MAX"
+      "]) || this.map.metric_property != ''"
+  };
+  // metric_property with a counting metric is silently ignored — likely a client mistake.
+  option (buf.validate.message).cel = {
+    id: "insight_query_spec.map_metric_property_only_for_numeric"
+    message: "metric_property is only valid for SUM, AVG, MIN, and MAX metrics"
+    expression:
+      "this.insight_type != shared.insights.v1.InsightType.INSIGHT_TYPE_MAP"
+      "|| this.map.metric_property == ''"
+      "|| this.map.metric in ["
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_SUM,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_AVG,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_MIN,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_MAX"
+      "]"
+  };
+}
+
+message QueryRequest {
+  // Per-granularity time-range caps bound query cost (partition scan range) and result set size
+  // (data points per series). Values are sized in hours; CLAUDE.md documents the human-friendly
+  // approximations.
+  option (buf.validate.message).cel = {
+    id: "query_request.granularity_minute_max_range"
+    message: "GRANULARITY_MINUTE requires a time range of at most 6 hours"
+    expression:
+      "this.granularity != shared.insights.v1.Granularity.GRANULARITY_MINUTE"
+      "|| this.time_range.to - this.time_range.from <= duration('6h')"
+  };
+  option (buf.validate.message).cel = {
+    id: "query_request.granularity_hour_max_range"
+    message: "GRANULARITY_HOUR requires a time range of at most 14 days"
+    expression:
+      "this.granularity != shared.insights.v1.Granularity.GRANULARITY_HOUR"
+      "|| this.time_range.to - this.time_range.from <= duration('336h')"
+  };
+  option (buf.validate.message).cel = {
+    id: "query_request.granularity_day_max_range"
+    message: "GRANULARITY_DAY requires a time range of at most 365 days"
+    expression:
+      "this.granularity != shared.insights.v1.Granularity.GRANULARITY_DAY"
+      "|| this.time_range.to - this.time_range.from <= duration('8760h')"
+  };
+  option (buf.validate.message).cel = {
+    id: "query_request.granularity_week_max_range"
+    message: "GRANULARITY_WEEK requires a time range of at most 1461 days (~4 years)"
+    expression:
+      "this.granularity != shared.insights.v1.Granularity.GRANULARITY_WEEK"
+      "|| this.time_range.to - this.time_range.from <= duration('35064h')"
+  };
+  option (buf.validate.message).cel = {
+    id: "query_request.granularity_month_max_range"
+    message: "GRANULARITY_MONTH requires a time range of at most 3652 days (~10 years)"
+    expression:
+      "this.granularity != shared.insights.v1.Granularity.GRANULARITY_MONTH"
+      "|| this.time_range.to - this.time_range.from <= duration('87660h')"
+  };
+
+  InsightQuerySpec spec = 1 [(buf.validate.field).required = true];
+  common.v1.TimeRange time_range = 2 [(buf.validate.field).required = true];
+  Granularity granularity = 3 [(buf.validate.field) = {
+    required: true
+    enum: {defined_only: true, not_in: [0]}
+  }];
+
+  // IANA timezone name (e.g. "Asia/Kolkata") used to align time-bucket boundaries
+  // to the viewer's local day/week/month instead of UTC. Empty (or "UTC") buckets on
+  // UTC boundaries — the historical behavior. The charset is restricted so the value
+  // can be embedded in the ClickHouse toTimeZone() call without an injection surface;
+  // the zone is otherwise validated server-side.
+  //
+  // SERVER-OVERWRITTEN, IGNORED ON INPUT: the InsightsService.Query handler replaces
+  // any client-supplied value with the project's stored reporting_timezone, so
+  // bucketing is server-authoritative. Do not set it on the request — it has no
+  // effect. (The field is retained rather than reserved because the executor and the
+  // dashboard render path both populate it internally.)
+  string timezone = 12 [(buf.validate.field).string = {
+    max_len: 64
+    pattern: "^[A-Za-z0-9_+/-]*$"
+  }];
+
+  reserved 4, 5, 6, 7, 8, 9, 10, 11;
+  reserved insight_type, events, breakdowns, breakdown_limit, filter_groups, filter_groups_operator, conversion_window, include_step_timing;
+}
+
+message QueryResponse {
+  oneof result {
+    TrendsResult trends = 2;
+    SegmentationResult segmentation = 3;
+    FunnelResult funnel = 4;
+    RetentionResult retention = 5;
+    UserFlowResult user_flow = 6;
+    TopKResult top_k = 7;
+  }
+  reserved 1; // was: repeated Series series
+}
+
+message SegmentUsersRequest {
+  common.v1.TimeRange time_range = 1 [(buf.validate.field).required = true];
+  repeated EventQuery events = 2 [(buf.validate.field).repeated.min_items = 1];
+  int32 page_size = 4 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 1000
+  }];
+  string page_token = 5;
+  reserved 3;
+
+  // Optional grouped filters for top-level conditions.
+  repeated FilterGroup filter_groups = 6;
+  common.v1.LogicalOperator filter_groups_operator = 7;
+}
+
+message SegmentUsersResponse {
+  repeated string distinct_ids = 1;
+  string next_page_token = 2;
+}
+
+enum InsightType {
+  INSIGHT_TYPE_UNSPECIFIED = 0;
+  INSIGHT_TYPE_TRENDS = 1;
+  INSIGHT_TYPE_SEGMENTATION = 2;
+  INSIGHT_TYPE_FUNNEL = 3;
+  INSIGHT_TYPE_RETENTION = 4;
+  INSIGHT_TYPE_USER_FLOW = 5;
+  INSIGHT_TYPE_TOP_K = 6;
+  INSIGHT_TYPE_MAP = 7;
+}
+
+// Granularity values are listed finest → coarsest by source-order convention.
+// Going forward (post-deployment of this enum): do not reorder or renumber existing
+// values — protobuf identity is the numeric tag, not the symbol. Add new values at
+// the next free ordinal.
+enum Granularity {
+  GRANULARITY_UNSPECIFIED = 0;
+  GRANULARITY_MINUTE = 1;
+  GRANULARITY_HOUR = 2;
+  GRANULARITY_DAY = 3;
+  GRANULARITY_WEEK = 4;
+  GRANULARITY_MONTH = 5;
+}
+
+enum AggregationType {
+  AGGREGATION_TYPE_UNSPECIFIED = 0;
+  AGGREGATION_TYPE_TOTAL = 1;
+  AGGREGATION_TYPE_UNIQUE_USERS = 2;
+  AGGREGATION_TYPE_PER_USER_AVG = 3;
+  AGGREGATION_TYPE_SUM = 4;
+  AGGREGATION_TYPE_AVG = 5;
+  AGGREGATION_TYPE_MIN = 6;
+  AGGREGATION_TYPE_MAX = 7;
+}
+
+enum SessionMetric {
+  SESSION_METRIC_UNSPECIFIED = 0;
+  // Number of distinct sessions started in the window.
+  SESSION_METRIC_SESSIONS = 1;
+  // Average session duration in seconds (last event minus first event per session).
+  SESSION_METRIC_AVG_DURATION = 2;
+  // Percentage of sessions with exactly one event after the optional scope is applied.
+  SESSION_METRIC_BOUNCE_RATE = 3;
+  // Count sessions by their first matching event's breakdown value (entry page).
+  // Requires TRENDS with exactly one breakdown.
+  SESSION_METRIC_ENTRY = 4;
+  // Count sessions by their last matching event's breakdown value (exit page).
+  // Requires TRENDS with exactly one breakdown.
+  SESSION_METRIC_EXIT = 5;
+  // Average number of scoped events per session. With a page_view scope this
+  // is pages per session. A first-class metric (not a client-side division of
+  // a pageview tile by a session tile) because pageviews are windowed on
+  // occurrence day while sessions are keyed on session start and never
+  // clipped — dividing two tiles disagrees visibly on boundary days.
+  SESSION_METRIC_AVG_EVENTS_PER_SESSION = 6;
+}
+
+message SessionQuery {
+  SessionMetric metric = 1 [(buf.validate.field) = {
+    required: true
+    enum: {defined_only: true, not_in: [0]}
+  }];
+
+  // Optional event scope used to decide which events participate in a session
+  // metric. Empty scope means all events in the session; a kind/filters scope
+  // measures only matching events inside each session.
+  common.v1.EventFilter scope = 2;
+}
+
+// UserFlowQuery configures a user-flow (Sankey) graph insight.
+message UserFlowQuery {
+  // Which attribute names each node.
+  enum NodeKind {
+    NODE_KIND_UNSPECIFIED = 0;
+    NODE_KIND_EVENT_KIND = 1;
+    NODE_KIND_PROPERTY = 2;
+  }
+  NodeKind node_kind = 1;
+
+  // Required when node_kind == NODE_KIND_PROPERTY.
+  string node_property = 2 [(buf.validate.field).string.pattern = "^\\$?[a-zA-Z0-9_.-]*$"];
+
+  // Traversal unit. UNSPECIFIED resolves to SESSION in the builder.
+  // Per-user (cross-session) grouping is not in the API yet — add a new enum
+  // value when semantics are defined.
+  enum GroupBy {
+    GROUP_BY_UNSPECIFIED = 0;
+    GROUP_BY_SESSION = 1;
+  }
+  GroupBy group_by = 3;
+
+  // Event-level filter: restricts which events are eligible to become nodes.
+  // Not a session filter — sessions with no eligible events emit no transitions.
+  common.v1.EventFilter scope = 4;
+
+  // Maximum transitions (edges) per session/user, i.e. the number of Sankey
+  // steps. A max_hops = N flow touches at most N+1 nodes (depths 0..N).
+  // Default 5 in builder. CEL max: 10.
+  int32 max_hops = 5;
+
+  // Top-N nodes to keep PER STEP (per depth) before collapsing the rest of that
+  // step into its $others bucket. Default 20. CEL min 2, max 50 when set.
+  int32 max_nodes = 6;
+
+  // Maximum links in response after the per-step $others collapse (lowest-value
+  // links dropped). Default 250. CEL max 500 when set.
+  int32 max_links = 7;
+}
+
+// TopKQuery configures a "top K" ranking insight: the top K values of a
+// dimension by an aggregate metric, plus a trailing $others bucket that
+// aggregates everything outside the top K.
+//
+// Granularity note: top K has no time bucketing, so QueryRequest.granularity
+// does not affect a top-K result. It is still required (every QueryRequest
+// requires one) and, for top K, serves only to select which time-range cap
+// applies — see the query_request.granularity_*_max_range rules: e.g.
+// GRANULARITY_MINUTE caps the window at 6h, GRANULARITY_MONTH at ~10y. Send the
+// coarsest granularity whose cap admits your intended window; the value is
+// otherwise inert for top K.
+message TopKQuery {
+  // What is being ranked.
+  enum Dimension {
+    DIMENSION_UNSPECIFIED = 0;
+    // Values of an event property (auto or custom), named by `property`.
+    DIMENSION_PROPERTY = 1;
+    // Event kinds ("top events").
+    DIMENSION_EVENT_KIND = 2;
+    // Canonical users. Rows carry profile enrichment when the user key
+    // resolves to a profile.
+    DIMENSION_USER = 3;
+  }
+  Dimension dimension = 1 [(buf.validate.field) = {
+    required: true
+    enum: {defined_only: true, not_in: [0]}
+  }];
+
+  // Property to rank values of. Required when dimension == DIMENSION_PROPERTY,
+  // forbidden otherwise. Same $-prefix encoding as Breakdown.property.
+  // Pattern uses * (not +) because this field is empty for other dimensions.
+  string property = 2 [(buf.validate.field).string.pattern = "^\\$?[a-zA-Z0-9_.-]*$"];
+
+  // Optional event scope (kind and/or per-event filters), same reuse as
+  // SessionQuery.scope. Empty scope means all events participate.
+  common.v1.EventFilter scope = 3;
+
+  // Metric to rank by. Defaults to TOTAL when unspecified. UNIQUE_USERS and
+  // PER_USER_AVG are rejected for DIMENSION_USER (degenerate when each group
+  // is a single user).
+  AggregationType metric = 4 [(buf.validate.field).enum.defined_only = true];
+
+  // Property to aggregate. Required for SUM/AVG/MIN/MAX; ignored otherwise.
+  // Pattern uses * (not +) because this field may be empty for count-based metrics.
+  string metric_property = 5 [(buf.validate.field).string.pattern = "^\\$?[a-zA-Z0-9_.-]*$"];
+
+  // Number of top rows to return, followed by the synthetic $others bucket
+  // unless omit_others is set. Default 10 in builder. CEL max 100.
+  int32 limit = 6 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 100
+  }];
+
+  // When true, omit the trailing synthetic $others overflow bucket and return
+  // only the top `limit` rows. Default false preserves the $others bucket, so
+  // every existing caller is unaffected and GetOmitOthers() is safe to read
+  // without a presence check. is_others is still projected on every row (always
+  // false when omitting), so clients keep reading the flag uniformly.
+  bool omit_others = 7;
+}
+
+// TopKResult holds the ranked rows, ordered metric-descending with the
+// synthetic $others bucket last (omitted when empty, or when omit_others is set).
+message TopKResult {
+  repeated TopKRow rows = 1;
+}
+
+message TopKRow {
+  // Dimension value: property value, event kind, or user key (canonical
+  // profile id when resolved, else the raw distinct_id). "$others" for the
+  // overflow bucket — but identify the bucket by is_others, NOT by matching
+  // this string: a real value can legitimately be the literal "$others"
+  // (same contract as UserFlowNode).
+  string dimension_value = 1;
+  double value = 2;
+  bool is_others = 3;
+  // Profile enrichment, populated only for DIMENSION_USER rows whose key
+  // resolved to a profile. Absent for the $others bucket and for
+  // unidentified distinct_ids.
+  TopKProfile profile = 4;
+}
+
+// MapQuery measures a metric per country for a choropleth. The dimension is
+// fixed to the $country auto-property, which is what makes this an insight type
+// rather than a chart style.
+//
+// Results arrive as QueryResponse.top_k, with no $others bucket. Every key is an
+// assigned ISO 3166-1 alpha-2 code; rows the server cannot confirm as one are
+// dropped — unresolved traffic, and any value a client wrote to $country
+// directly — so the rows do not sum to the project's total.
+message MapQuery {
+  // Optional event scope (kind and/or per-event filters), same reuse as
+  // TopKQuery.scope. Empty scope means all events participate.
+  common.v1.EventFilter scope = 1;
+
+  // Metric to measure per country. Defaults to TOTAL when unspecified.
+  AggregationType metric = 2 [(buf.validate.field).enum.defined_only = true];
+
+  // Property to aggregate. Required for SUM/AVG/MIN/MAX; ignored otherwise.
+  // Pattern uses * (not +) because this field may be empty for count-based metrics.
+  string metric_property = 3 [(buf.validate.field).string.pattern = "^\\$?[a-zA-Z0-9_.-]*$"];
+}
+
+// TopKProfile is the profile enrichment attached to a DIMENSION_USER row.
+message TopKProfile {
+  string id = 1;
+  string external_id = 2;
+  // Same shape as shared.profiles.v1.Profile.properties.
+  google.protobuf.Struct properties = 3;
+}
+
+message UserFlowNode {
+  // Opaque unique key, referenced by UserFlowLink.source/target. Unique per
+  // (depth, label): the same event kind or property value at two different steps
+  // is two distinct nodes (e.g. "page_view" at step 0 and step 2). Treat as an
+  // opaque token — do not parse it; use label for display and depth for column.
+  string id = 1;
+  // is_others marks the synthetic per-step overflow bucket that aggregates the
+  // nodes pruned by max_nodes at that depth. Real nodes have is_others=false.
+  // Clients must identify the bucket by this flag, NOT by matching id/label
+  // against "$others" — a real event kind or property value can legitimately be
+  // the literal string "$others".
+  bool is_others = 2;
+  // depth is the 0-based step index — the Sankey column. It is the node's
+  // position in each session's time-ordered event sequence. Every link connects
+  // a node at depth d to a node at depth d+1, so the graph is a layered DAG.
+  int32 depth = 3;
+  // label is the display name: the event kind (NODE_KIND_EVENT_KIND) or property
+  // value (NODE_KIND_PROPERTY). The overflow bucket carries "$others" but must be
+  // rendered from is_others, not by matching this string.
+  string label = 4;
+}
+
+message UserFlowLink {
+  string source = 1;
+  string target = 2;
+  int64 value = 3 [(buf.validate.field).int64.gte = 1];
+}
+
+message UserFlowResult {
+  repeated UserFlowNode nodes = 1;
+  repeated UserFlowLink links = 2;
+}
+
+message FilterGroup {
+  repeated common.v1.PropertyFilter filters = 1 [(buf.validate.field).repeated.min_items = 1];
+  common.v1.LogicalOperator operator = 2;
+}
+
+message EventQuery {
+  option (buf.validate.message).cel = {
+    id: "event_query.property_required_for_numeric_agg"
+    message: "aggregation_property is required for SUM, AVG, MIN, and MAX aggregation types"
+    expression:
+      "!(this.aggregation in ["
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_SUM,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_AVG,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_MIN,"
+      "  shared.insights.v1.AggregationType.AGGREGATION_TYPE_MAX"
+      "]) || this.aggregation_property != ''"
+  };
+
+  common.v1.EventFilter event = 1;
+  // Aggregation type. Defaults to TOTAL when unspecified.
+  // Only used for trends and segmentation; ignored for funnel and retention.
+  AggregationType aggregation = 2 [(buf.validate.field).enum.defined_only = true];
+  // Property name to aggregate on. Required for SUM/AVG/MIN/MAX; ignored for TOTAL/UNIQUE_USERS/PER_USER_AVG.
+  // Pattern uses * (not +) because this field may be empty for count-based aggregation types.
+  string aggregation_property = 3 [(buf.validate.field).string.pattern = "^\\$?[a-zA-Z0-9_.-]*$"];
+}
+
+message Breakdown {
+  string property = 1 [(buf.validate.field) = {
+    required: true
+    string: {pattern: "^\\$?[a-zA-Z0-9_.-]+$"}
+  }];
+}
+
+// TrendsResult contains one TrendSeries per (event_kind, breakdown) combination.
+message TrendsResult {
+  repeated TrendSeries series = 1;
+}
+
+// TrendSeries is a single time series for a trends insight.
+message TrendSeries {
+  string event_kind = 1;
+  map<string, string> breakdown = 2;
+  repeated DataPoint points = 3;
+}
+
+// SegmentationResult is a single aggregate value.
+message SegmentationResult {
+  double total = 1;
+}
+
+// FunnelResult contains one FunnelSeries per breakdown combination.
+// When no breakdown is requested, there is exactly one series with an empty breakdown map.
+message FunnelResult {
+  repeated FunnelSeries series = 1;
+}
+
+// FunnelSeries groups funnel steps for a single breakdown combination.
+// Map keys are property names from the request's breakdowns list; values are the attributed breakdown values for this series.
+message FunnelSeries {
+  map<string, string> breakdown = 1;
+  repeated FunnelStep steps = 2;
+}
+
+// DistributionBucket is a single histogram bucket for conversion time distribution.
+message DistributionBucket {
+  // Human-readable label, e.g. "0-30s", "30s-2m".
+  string label = 1 [(buf.validate.field).string.min_len = 1];
+  // Exclusive upper bound. Absent for the last open-ended bucket ("24h+"); use the label instead.
+  google.protobuf.Duration upper_bound = 2 [(buf.validate.field).duration.gte = {seconds: 0}];
+  // Number of users whose conversion time fell in this bucket.
+  int64 count = 3 [(buf.validate.field).int64.gte = 0];
+}
+
+// StepTiming captures conversion-time statistics for a single funnel step
+// relative to the previous step. Present on every non-entry step when
+// include_step_timing is true; absent on the entry step (no previous step
+// to convert from) and when include_step_timing is false on the request.
+// When the step has zero converters, all four fields are zero-valued: the
+// scalar durations are zero and every distribution bucket has count=0.
+// Clients should consult FunnelStep.total to distinguish "no conversion"
+// (count=0) from "fast conversion" (count>0 with low p95). When present,
+// distribution always contains exactly 8 buckets in the canonical order
+// documented on each bucket's label.
+message StepTiming {
+  // Average time from the previous step to this one.
+  google.protobuf.Duration avg = 1 [(buf.validate.field).duration.gte = {seconds: 0}];
+  // Median time from the previous step to this one.
+  google.protobuf.Duration median = 2 [(buf.validate.field).duration.gte = {seconds: 0}];
+  // 95th-percentile time from the previous step to this one.
+  google.protobuf.Duration p95 = 3 [(buf.validate.field).duration.gte = {seconds: 0}];
+  // Histogram of conversion times across 8 fixed buckets in canonical order.
+  // Length is exactly 8 by contract; clients can index by position.
+  repeated DistributionBucket distribution = 4 [(buf.validate.field).repeated = {
+    min_items: 8
+    max_items: 8
+  }];
+}
+
+// FunnelStep is a single stage in a funnel.
+message FunnelStep {
+  string event_kind = 1;
+  double total = 2;
+  // Conversion-time stats for this step. Absent for the first step (no previous
+  // step to convert from) and when include_step_timing is false on the request.
+  StepTiming timing = 3;
+}
+
+// RetentionResult contains one RetentionSeries per breakdown combination.
+// When no breakdown is requested, there is exactly one series with an empty breakdown map.
+message RetentionResult {
+  repeated RetentionSeries series = 1;
+}
+
+// RetentionSeries groups retention cohorts for a single breakdown combination.
+// Map keys are property names from the request's breakdowns list; values are the attributed breakdown values for this series.
+message RetentionSeries {
+  map<string, string> breakdown = 1;
+  repeated RetentionCohort cohorts = 2;
+}
+
+// RetentionCohort is a single cohort's retention data.
+message RetentionCohort {
+  // Cohort bucket timestamp (RFC3339).
+  string cohort = 1;
+  double cohort_size = 2;
+  repeated DataPoint points = 3;
+}
+
+message DataPoint {
+  google.protobuf.Timestamp time = 1;
+  double value = 2;
+}
+
+message GetPropertyValuesRequest {
+  string property_key = 1 [(buf.validate.field) = {
+    required: true
+    // See common.v1.PropertyFilter.property for the empty-segment rationale.
+    string: {pattern: "^\\$?[a-zA-Z0-9_-]+(\\.[a-zA-Z0-9_-]+)*$"}
+  }];
+  common.v1.PropertySource source = 2 [(buf.validate.field) = {
+    required: true
+    enum: {defined_only: true}
+  }];
+  string event_kind = 3 [(buf.validate.field) = {
+    string: {pattern: "^[a-zA-Z0-9_.-]*$"}
+  }];
+}
+
+message GetPropertyValuesResponse {
+  repeated string values = 1;
+}

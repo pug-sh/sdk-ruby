@@ -1,0 +1,45 @@
+# Generates Ruby protobuf code for the SDK wire protos (services + PropertyValue), the
+# well-known-event *Properties schemas, and the server-only shared/** services this SDK reads
+# from. Output is committed to lib/pug/gen.
+#
+# buf/validate IS generated: no Ruby protovalidate exists, so the SDK decodes the rules from
+# the descriptors' options itself (lib/pug/validator.rb) and needs the FieldRules classes.
+#
+# The Ruby generator is built into protoc, so the Makefile pins protoc's version. Managed mode
+# moves every package under Pug::Proto, so the gem defines no top-level Buf/Common/Sdk/Shared
+# modules; the proto package names in the descriptors are unchanged.
+version: v2
+clean: true
+managed:
+  enabled: true
+  override:
+    - file_option: ruby_package
+      path: buf/validate
+      value: Pug::Proto::Buf::Validate
+    - file_option: ruby_package
+      path: common/events/v1
+      value: Pug::Proto::Common::Events::V1
+    - file_option: ruby_package
+      path: common/v1
+      value: Pug::Proto::Common::V1
+    - file_option: ruby_package
+      path: sdk/devices/v1
+      value: Pug::Proto::Sdk::Devices::V1
+    - file_option: ruby_package
+      path: sdk/events/v1
+      value: Pug::Proto::Sdk::Events::V1
+    - file_option: ruby_package
+      path: sdk/profiles/v1
+      value: Pug::Proto::Sdk::Profiles::V1
+    - file_option: ruby_package
+      path: shared/activity/v1
+      value: Pug::Proto::Shared::Activity::V1
+    - file_option: ruby_package
+      path: shared/insights/v1
+      value: Pug::Proto::Shared::Insights::V1
+    - file_option: ruby_package
+      path: shared/profiles/v1
+      value: Pug::Proto::Shared::Profiles::V1
+plugins:
+  - protoc_builtin: ruby
+    out: lib/pug/gen
