@@ -193,7 +193,6 @@ class BatcherTest < Minitest::Test
 
       @sent << events
     end
-    b.instance_variable_set(:@max_size, 1)
     [1, 2].each { |i| b.enqueue(i, 1) }
     b.flush(timeout: 5)
     wait_until { @sent.size == 1 }
@@ -203,9 +202,11 @@ class BatcherTest < Minitest::Test
 
   def test_backs_off_after_a_transient_failure
     attempts = Queue.new
+    calls = 0
     b = batcher(max_size: 2, max_wait: 0.3, max_queue_size: 99) do |events|
       attempts << events
-      raise TRANSIENT if attempts.size == 1
+      calls += 1
+      raise TRANSIENT if calls == 1
 
       @sent << events
     end
@@ -218,6 +219,59 @@ class BatcherTest < Minitest::Test
     assert_equal 0, attempts.size, "size triggers must not retry during backoff"
     assert_equal [1, 2], @sent.pop(timeout: 5)
     assert_equal [3], @sent.pop(timeout: 5)
+  end
+
+  def test_a_size_trigger_from_a_failing_send_waits_out_the_backoff
+    entered = Queue.new
+    gate = Queue.new
+    calls = 0
+    b = batcher(max_size: 2, max_wait: 60, max_queue_size: 99) do |_|
+      calls += 1
+      if calls == 1
+        entered << true
+        gate.pop
+      end
+      raise TRANSIENT
+    end
+    b.enqueue(1, 1)
+    b.enqueue(2, 1)
+    entered.pop(timeout: 5)
+    b.enqueue(3, 1)
+    b.enqueue(4, 1)
+    gate << :go
+    sleep 0.2
+    assert_equal 1, calls
+  end
+
+  # As sdk-go's TestBatchRetryWaitsMaxWaitFromTheFailure: a timer an enqueue armed during a slow
+  # send must not retry the moment it fails.
+  def test_a_retry_waits_from_the_failure
+    starts = Queue.new
+    calls = 0
+    b = batcher(max_size: 99, max_wait: 0.05, max_queue_size: 99) do |_|
+      starts << Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      calls += 1
+      next if calls > 1
+
+      sleep 0.2
+      raise TRANSIENT
+    end
+    b.enqueue(1, 1)
+    first = starts.pop(timeout: 5)
+    b.enqueue(2, 1)
+    retried = starts.pop(timeout: 5)
+    assert_operator retried - first, :>=, 0.2 + Pug::Batcher::MIN_RETRY_WAIT - 0.01
+  end
+
+  def test_a_zero_max_wait_still_waits_between_retries
+    calls = 0
+    b = batcher(max_size: 99, max_wait: 0, max_queue_size: 99) do |_|
+      calls += 1
+      raise TRANSIENT
+    end
+    b.enqueue(1, 1)
+    sleep 0.3
+    assert_equal 1, calls
   end
 
   def test_requeue_respects_max_queue_size
@@ -241,21 +295,50 @@ class BatcherTest < Minitest::Test
     assert_equal [1], events
   end
 
-  def test_close_with_a_timeout_reports_the_rest
+  # An at_exit close must account for every event before the process goes, including those of a
+  # send that outlives it.
+  def test_close_with_a_timeout_reports_every_event_before_returning
     gate = Queue.new
-    b = batcher(max_size: 1, max_wait: 60, max_queue_size: 99) do |events|
+    b = batcher(max_size: 2, max_wait: 60, max_queue_size: 99) do |events|
       gate.pop
       @sent << events
     end
-    b.enqueue(1, 1)
+    (1..5).each { |i| b.enqueue(i, 1) }
     wait_until { b.instance_variable_get(:@sending) }
-    b.enqueue(2, 1)
     refute b.close(timeout: 0.1)
-    error, events = @errors.pop(timeout: 5)
-    assert_kind_of Pug::ClosedError, error
-    assert_equal [2], events
+    in_flight, unsent = drain(@errors)
+    assert_equal [Pug::ClosedError, [1, 2]], [in_flight.first.class, in_flight.last]
+    assert_match(/close timed out with 2 event\(s\) still being sent/, in_flight.first.message)
+    assert_equal [Pug::ClosedError, [3, 4, 5]], [unsent.first.class, unsent.last]
+    assert_match(/Client closed with 3 undelivered event\(s\), dropped/, logs.errors.last)
     gate << :go
-    assert_equal [1], @sent.pop(timeout: 5)
+    assert_equal [1, 2], @sent.pop(timeout: 5)
+    wait_until { !b.instance_variable_get(:@thread).alive? }
+    assert_empty drain(@sent)
+    assert_empty drain(@errors), "events were reported twice"
+  end
+
+  def test_a_failed_send_that_outlives_close_is_not_reported_twice
+    gate = Queue.new
+    b = batcher do |_|
+      gate.pop
+      raise TRANSIENT
+    end
+    b.enqueue(1, 1)
+    refute b.flush(timeout: 0)
+    wait_until { b.instance_variable_get(:@sending) }
+    refute b.close(timeout: 0.1)
+    assert_equal [[1]], drain(@errors).map(&:last)
+    gate << :go
+    wait_until { !b.instance_variable_get(:@thread).alive? }
+    assert_empty drain(@errors)
+  end
+
+  def test_close_logs_what_it_drops_without_an_on_error
+    b = @batcher = Pug::Batcher.new(->(_) { raise TRANSIENT }, { max_size: 2 }, nil, Pug::Log.new(logs))
+    3.times { |i| b.enqueue(i, 1) }
+    b.close(timeout: 5)
+    assert_includes logs.errors, "[Pug SDK] Client closed with 1 undelivered event(s), dropped"
   end
 
   def test_flush_honors_its_timeout
@@ -313,29 +396,49 @@ class BatcherTest < Minitest::Test
     assert_equal([false, true], callers.map { |thread, _| thread.equal?(closer) })
   end
 
+  # NotImplementedError, a common placeholder, isn't a StandardError.
   def test_contains_a_raising_on_error
-    b = Pug::Batcher.new(->(_) {}, { max_size: 99, max_wait: 60, max_queue_size: 1 }, ->(*) { raise "callback boom" },
-                         Pug::Log.new(logs))
-    b.enqueue(1, 1)
-    b.enqueue(2, 1)
-    assert_match(/on_error callback raised; 1 event\(s\) may be lost/, logs.errors.last)
-    b.close(timeout: 5)
+    [RuntimeError, NotImplementedError].each do |error_class|
+      b = Pug::Batcher.new(->(_) {}, { max_size: 99, max_wait: 60, max_queue_size: 1 },
+                           ->(*) { raise error_class, "callback boom" }, Pug::Log.new(logs))
+      b.enqueue(1, 1)
+      b.enqueue(2, 1)
+      assert_match(/on_error callback raised; 1 event\(s\) may be lost: #{error_class}/, logs.errors.last)
+      b.close(timeout: 5)
+    end
+  end
+
+  def test_logs_a_crashed_sender_and_restarts_it
+    crash = Class.new(Exception) # rubocop:disable Lint/InheritException
+    @batcher = Pug::Batcher.new(lambda { |events|
+      raise "boom" if events == [1]
+
+      @sent << events
+    }, { max_size: 1, max_wait: 60, max_queue_size: 99 }, ->(*) { raise crash }, Pug::Log.new(logs))
+    @batcher.enqueue(1, 1)
+    wait_until { logs.errors.any?(/Event sender stopped unexpectedly/) }
+    @batcher.enqueue(2, 1)
+    assert_equal [2], @sent.pop(timeout: 5)
   end
 
   def test_recovers_from_a_raising_sink
-    calls = 0
-    b = batcher do |events|
-      calls += 1
-      raise NoMethodError, "bug" if calls == 1
+    crash = Class.new(Exception) # rubocop:disable Lint/InheritException
+    [NoMethodError, crash].each do |error_class|
+      calls = 0
+      b = batcher do |events|
+        calls += 1
+        raise error_class, "bug" if calls == 1
 
-      @sent << events
+        @sent << events
+      end
+      b.enqueue(1, 1)
+      b.flush(timeout: 5)
+      b.enqueue(2, 1)
+      b.flush(timeout: 5)
+      assert_equal [[2]], drain(@sent)
+      assert_equal [1], drain(@errors).first.last
+      b.close(timeout: 5)
     end
-    b.enqueue(1, 1)
-    b.flush(timeout: 5)
-    b.enqueue(2, 1)
-    b.flush(timeout: 5)
-    assert_equal [[2]], drain(@sent)
-    assert_equal [1], drain(@errors).first.last
   end
 
   def test_accounts_for_every_event

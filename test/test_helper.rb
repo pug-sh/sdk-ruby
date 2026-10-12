@@ -130,11 +130,6 @@ module Pug
 
     UUID = "0199d0c1-6a3e-7e8e-9f00-000000000000"
 
-    def new_client(**)
-      @logs ||= LogCapture.new
-      Pug::Client.new(api_key: "prv_test", endpoint: "http://localhost:1", logger: @logs, **)
-    end
-
     def logs
       @logs ||= LogCapture.new
     end
@@ -142,11 +137,7 @@ module Pug
     def wait_until(timeout: 5)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
       until yield
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          raise Minitest::Assertion,
-                "timed out waiting for condition"
-        end
-
+        flunk "timed out waiting for condition" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
         sleep 0.01
       end
     end

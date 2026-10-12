@@ -7,9 +7,8 @@ module Pug
   # (common.events.v1.platforms) option lists PLATFORM_SERVER or is unset; one tagged only for
   # web, mobile or desktop is a custom event here.
   module WellKnown
-    KIND = Proto::Options.number("common.events.v1.kind")
-    PLATFORMS = Proto::Options.number("common.events.v1.platforms")
-    SERVER = Proto::Common::Events::V1::Platform::PLATFORM_SERVER
+    KIND = Proto.extension("common.events.v1.kind")
+    PLATFORMS = Proto.extension("common.events.v1.platforms")
 
     def self.build
       namespace = Proto::Common::Events::V1
@@ -17,11 +16,11 @@ module Pug
       classes = classes.select { |klass| klass.is_a?(Class) && klass.respond_to?(:descriptor) }
       classes.sort_by { |klass| klass.descriptor.name }.each_with_object({}) do |klass, catalog|
         options = klass.descriptor.options
-        kind = Proto::Options.string(options, KIND)
-        next if kind.nil? || kind.empty? || catalog.key?(kind)
+        kind = KIND.get(options)
+        next if kind.empty? || catalog.key?(kind)
 
-        platforms = Proto::Options.enums(options, PLATFORMS)
-        catalog[kind] = klass if platforms.empty? || platforms.include?(SERVER)
+        platforms = PLATFORMS.get(options)
+        catalog[kind] = klass if platforms.empty? || platforms.include?(:PLATFORM_SERVER)
       end.freeze
     end
 

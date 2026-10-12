@@ -65,9 +65,9 @@ module Pug
       @connect.unary(path, self.class.request(name, request), response)
     end
 
-    def stream(name, request, &)
+    def stream(name, request, timeout: nil, &)
       path, _, response = PROCEDURES.fetch(name)
-      @connect.server_stream(path, self.class.request(name, request), response, &)
+      @connect.server_stream(path, self.class.request(name, request), response, timeout: timeout, &)
     end
   end
 end

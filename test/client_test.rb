@@ -14,7 +14,7 @@ class ClientTest < Minitest::Test
 
   # endpoint is never dialed: these tests stub the RPC layer or stop before any send.
   def client(**)
-    @client = new_client(**)
+    @client = Pug::Client.new(api_key: "prv_test", endpoint: "http://localhost:1", logger: logs, **)
   end
 
   def stub_rpc(client, &handler)
@@ -36,6 +36,41 @@ class ClientTest < Minitest::Test
   def test_rejects_a_key_that_is_not_private
     error = assert_raises(ArgumentError) { Pug::Client.new(api_key: "pub_test") }
     assert_match(/private key/, error.message)
+  end
+
+  # Net::HTTP would refuse the header on every request.
+  def test_rejects_a_key_with_whitespace_or_other_unprintable_characters
+    ["prv_test\n", "prv_te st", "prv_tést", "prv_\xFF".b].each do |key|
+      error = assert_raises(ArgumentError) { Pug::Client.new(api_key: key) }
+      assert_match(/printable ASCII without spaces/, error.message)
+    end
+  end
+
+  # An IO's warn is Kernel#warn, which is private, so every log line would vanish.
+  def test_rejects_a_logger_without_public_warn_and_error
+    [$stderr, Object.new].each do |logger|
+      error = assert_raises(ArgumentError) { Pug::Client.new(api_key: "prv_test", logger: logger) }
+      assert_match(/logger must respond to warn and error/, error.message)
+    end
+  end
+
+  def test_on_error_must_take_the_error_and_the_events
+    [->(_) {}, ->(_, _, _) {}, Class.new { def call(_) = nil }.new].each do |on_error|
+      error = assert_raises(ArgumentError) { Pug::Client.new(api_key: "prv_test", on_error: on_error) }
+      assert_match(/on_error must take two arguments/, error.message)
+    end
+    [->(_, _) {}, ->(*) {}, ->(_error, _events, _extra = nil) {}, proc { |_| },
+     Class.new { def call(_, _) = nil }.new].each do |on_error|
+      Pug::Client.new(api_key: "prv_test", on_error: on_error, logger: logs).close
+    end
+  end
+
+  def test_inspect_leaves_out_the_key_and_the_events
+    pug = client
+    pug.track("u", "my.custom", note: "buffered-event")
+    [pug, pug.profiles, pug.activity, pug.insights].each do |object|
+      refute_match(/prv_test|buffered-event/, object.inspect)
+    end
   end
 
   def test_rejects_an_endpoint_that_is_not_an_absolute_http_url
@@ -127,6 +162,54 @@ class ClientTest < Minitest::Test
     assert_equal UUID, second.session_id
   end
 
+  # Braceless, timestamp: t looks just like a property; braces keep a property named like an option.
+  def test_braceless_keywords_named_after_an_option_set_it
+    pug = client
+    rpc = stub_rpc(pug) { BatchCreateResponse.new }
+    pug.track("u", "my.custom", timestamp: Time.at(0), session_id: UUID)
+    pug.track("u", "my.custom", plan: "pro", location: { country: "DE" })
+    pug.track("u", "my.custom", { location: "Berlin" })
+    options_only, mixed, braced = sent_events(pug, rpc)
+    assert_equal [0, UUID, {}], [options_only.occur_time.seconds, options_only.session_id,
+                                 options_only.custom_properties.to_h]
+    assert_equal %w[pro DE],
+                 [mixed.custom_properties["plan"].string_value, mixed.auto_properties["$country"].string_value]
+    assert_equal "Berlin", braced.custom_properties["location"].string_value
+    assert_empty logs.warnings
+  end
+
+  def test_identify_takes_braceless_options_too
+    pug = client
+    rpc = stub_rpc(pug)
+    pug.identify("user_1", anonymous_id: "anon-1")
+    pug.identify("user_1", plan: "pro", device_id: "d1")
+    first, second = rpc.recorded.map(&:last)
+    assert_equal ["anon-1", false], [first.anonymous_id, first.has_traits?]
+    assert_equal ["d1", { "plan" => "pro" }], [second.device_id, second.traits.to_h]
+  end
+
+  def test_flush_and_close_warn_about_a_timeout_that_is_not_a_number_and_still_drain
+    pug = client
+    rpc = stub_rpc(pug) { BatchCreateResponse.new }
+    pug.track("u", "my.custom")
+    assert pug.flush(timeout: "5")
+    pug.track("u", "my.custom")
+    assert pug.close(timeout: Float::NAN)
+    assert_equal 2, rpc.recorded.size
+    assert_equal ["[Pug SDK] flush() timeout must be a number of seconds; waiting without one.",
+                  "[Pug SDK] close() timeout must be a number of seconds; waiting without one."], logs.warnings
+  end
+
+  def test_close_releases_connections_even_when_draining_raises
+    pug = client
+    pug.instance_variable_get(:@batcher).define_singleton_method(:close) { |**| raise "boom" }
+    released = false
+    pug.instance_variable_get(:@connect).define_singleton_method(:close) { released = true }
+    assert_raises(RuntimeError) { pug.close }
+    assert released
+    @client = nil
+  end
+
   def test_track_session_id_option
     pug = client
     rpc = stub_rpc(pug) { BatchCreateResponse.new }
@@ -159,8 +242,7 @@ class ClientTest < Minitest::Test
     logger = Object.new
     def logger.error(*) = raise("logger down")
     def logger.warn(*) = raise("logger down")
-    @client = Pug::Client.new(api_key: "prv_test", endpoint: "http://localhost:1", logger: logger)
-    assert_nil @client.track("", "my.custom")
+    assert_nil client(logger: logger).track("", "my.custom")
   end
 
   def test_on_error_receives_undeliverable_events
@@ -195,6 +277,14 @@ class ClientTest < Minitest::Test
     assert_empty rpc.recorded
   end
 
+  def test_identify_drops_the_call_on_an_unusable_anonymous_id
+    pug = client
+    rpc = stub_rpc(pug)
+    [5, "anon-\xFF".b].each { |anonymous_id| assert_nil pug.identify("user_1", nil, anonymous_id: anonymous_id) }
+    assert_empty rpc.recorded
+    assert_equal 2, logs.errors.grep(/anonymous_id/).size
+  end
+
   def test_identify_names_the_reserved_prefix
     client.identify("cookieless-abc")
     assert_match(/external_id must not start with the reserved 'cookieless-' prefix/, logs.errors.last)
@@ -210,8 +300,20 @@ class ClientTest < Minitest::Test
   end
 
   def test_identify_drops_traits_that_are_not_json_serializable
-    client.identify("user_1", score: Float::NAN)
-    assert_match(/traits must be JSON-serializable/, logs.errors.last)
+    pug = client
+    rpc = stub_rpc(pug)
+    [{ score: Float::NAN }, { tags: Set["a"] }, { id: (2**53) + 1 }].each { |traits| pug.identify("user_1", traits) }
+    assert_empty rpc.recorded
+    assert_equal 3, logs.errors.grep(/traits must be JSON-serializable/).size
+    assert_match(/9007199254740993 is out of range/, logs.errors.last)
+  end
+
+  def test_identify_sends_nested_times_as_iso8601
+    pug = client
+    rpc = stub_rpc(pug)
+    pug.identify("user_1", { signed_up: { at: Time.at(0).utc }, seats: 2**53 })
+    assert_equal({ "signed_up" => { "at" => "1970-01-01T00:00:00.000Z" }, "seats" => 2.0**53 },
+                 rpc.recorded.first.last.traits.to_h)
   end
 
   def test_identify_sends_the_request
@@ -265,7 +367,8 @@ class ReadsTest < Minitest::Test
       @error = error
     end
 
-    def stream(_name, _request, &)
+    def stream(name, request, timeout: nil, &)
+      @calls << [name, request, timeout]
       @pages.each(&)
       raise @error if @error
     end
@@ -319,5 +422,21 @@ class ReadsTest < Minitest::Test
     assert_equal :permission_denied, raised.code
     raised = assert_raises(Pug::Error) { Pug::Profiles.new(StreamingRPC.new(error: RuntimeError.new("bug"))).list.next }
     assert_nil raised.code
+  end
+
+  def test_list_takes_a_braceless_request_and_a_timeout
+    rpc = StreamingRPC.new
+    profiles = Pug::Profiles.new(rpc)
+    profiles.list(include_bots: true).to_a
+    profiles.list({ include_bots: true }, timeout: 60).to_a
+    profiles.list(timeout: 0.5) { nil }
+    assert_equal [[:profiles_list, { include_bots: true }, nil], [:profiles_list, { include_bots: true }, 60],
+                  [:profiles_list, {}, 0.5]], rpc.recorded
+  end
+
+  def test_list_refuses_a_bad_timeout_or_a_request_given_twice
+    profiles = Pug::Profiles.new(StreamingRPC.new)
+    assert_raises(Pug::Error) { profiles.list(timeout: "60").to_a }
+    assert_raises(Pug::Error) { profiles.list({ include_bots: true }, page_token: "t").to_a }
   end
 end

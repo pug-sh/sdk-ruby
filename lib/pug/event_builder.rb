@@ -3,6 +3,8 @@
 require "date"
 require "json"
 require "securerandom"
+require "time"
+require_relative "batcher"
 require_relative "countries"
 require_relative "log"
 require_relative "proto"
@@ -21,10 +23,8 @@ module Pug
     # least the code-point count, so a 1024-byte cap is stricter, never looser.
     MAX_STRING_BYTES = 1024
 
-    # The server refuses request bodies over 8 MiB with resource_exhausted, a transient code, so
-    # an event too big to fit a request would be retried forever. Half the cap leaves room for
-    # the request envelope.
-    MAX_EVENT_BYTES = 4 * 1024 * 1024
+    # An event too big for a batch of its own would be retried forever.
+    MAX_EVENT_BYTES = Batcher::MAX_BATCH_BYTES
 
     NANOS = 1_000_000_000
     # Past 2^53 a Float may already have been rounded, so it can't stand for an exact integer.
@@ -65,13 +65,13 @@ module Pug
     Duration = ::Google::Protobuf::Duration
     Timestamp = ::Google::Protobuf::Timestamp
 
-    SchemaField = Struct.new(:descriptor, :name, :json_name, :type, :explicit)
+    SchemaField = Struct.new(:descriptor, :name, :json_name, :type)
     Schema = Struct.new(:klass, :name, :by_key, :fields)
 
     # Field lookups for every well-known schema, by proto name and JSON name, worked out once.
     SCHEMAS = WellKnown::CATALOG.transform_values do |klass|
       fields = klass.descriptor.map do |field|
-        SchemaField.new(field, field.name, field.json_name, field.type, field.has_presence?).freeze
+        SchemaField.new(field, field.name, field.json_name, field.type).freeze
       end
       by_key = fields.flat_map { |field| [[field.name, field], [field.json_name, field]] }.to_h
       Schema.new(klass, klass.descriptor.name, by_key.freeze, fields.freeze).freeze
@@ -94,26 +94,6 @@ module Pug
 
     Unsupported = Object.new.freeze
 
-    def self.utf8(string)
-      unless [Encoding::UTF_8, Encoding::BINARY, Encoding::US_ASCII].include?(string.encoding)
-        string = string.encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: "\uFFFD")
-      end
-      string = string.dup.force_encoding(Encoding::UTF_8) unless string.encoding == Encoding::UTF_8
-      string.valid_encoding? ? string : string.scrub("\uFFFD")
-    end
-
-    def self.time?(value)
-      value.is_a?(Time) || value.is_a?(DateTime)
-    end
-
-    def self.real_number?(value)
-      value.is_a?(Numeric) && value.real?
-    end
-
-    def self.type_name(value)
-      value.nil? ? "nil" : value.class.name
-    end
-
     # options.proto's wire form for a Duration: "1.5s", never "1.500s". Summing first fixes nanos
     # that are out of range or signed against the seconds.
     def self.format_duration(seconds, nanos)
@@ -123,12 +103,36 @@ module Pug
       "#{"-" if total.negative?}#{whole}#{".#{fraction}" unless fraction.empty?}s"
     end
 
+    # JSON.generate writes an object it doesn't know, such as a Set, as its to_s. Here times become
+    # ISO 8601 and other real numbers floats, as they would on their own, and anything else is
+    # refused, as is an integer past max_integer. Like JSON, it stops at 100 levels, for cycles.
+    def self.json_ready(value, max_integer: nil, depth: 0)
+      raise NotRepresentable, "nested more than 100 levels deep" if depth > 100
+
+      case value
+      when Hash then value.to_h { |key, item| [key.to_s, json_ready(item, max_integer:, depth: depth + 1)] }
+      when Array then value.map { |item| json_ready(item, max_integer:, depth: depth + 1) }
+      when String, Float, true, false, nil then value
+      when Integer
+        raise NotRepresentable, "#{value} is out of range (±#{max_integer})" if max_integer && value.abs > max_integer
+
+        value
+      when Symbol then value.to_s
+      when Time, DateTime then value.iso8601(3)
+      when Date then value.iso8601
+      else
+        raise NotRepresentable, "#{value.class} has no JSON form" unless value.is_a?(Numeric) && value.real?
+
+        Float(value)
+      end
+    end
+
     def initialize(log)
       @log = log
     end
 
     def build(kind, session_id, distinct_id, properties = nil, timestamp: nil, location: nil)
-      kind = self.class.utf8(kind.to_s)
+      kind = utf8(kind.to_s)
       schema = SCHEMAS[kind]
       custom = if schema
                  well_known_properties(schema, kind, properties || {})
@@ -162,6 +166,26 @@ module Pug
 
     private
 
+    def utf8(string)
+      unless [Encoding::UTF_8, Encoding::BINARY, Encoding::US_ASCII].include?(string.encoding)
+        string = string.encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: "\uFFFD")
+      end
+      string = string.dup.force_encoding(Encoding::UTF_8) unless string.encoding == Encoding::UTF_8
+      string.valid_encoding? ? string : string.scrub("\uFFFD")
+    end
+
+    def time?(value)
+      value.is_a?(Time) || value.is_a?(DateTime)
+    end
+
+    def real_number?(value)
+      value.is_a?(Numeric) && value.real?
+    end
+
+    def type_name(value)
+      value.nil? ? "nil" : value.class.name
+    end
+
     def new_event(kind, session_id, distinct_id, auto, custom, timestamp)
       Event.new(
         event_id: SecureRandom.uuid_v7,
@@ -180,8 +204,8 @@ module Pug
     def occur_time(timestamp)
       return Timestamp.from_time(Time.now) if timestamp.nil?
 
-      time = timestamp.to_time if self.class.time?(timestamp)
-      return Timestamp.new(seconds: time.to_i, nanos: time.nsec) if time&.between?(MIN_OCCUR_TIME, MAX_OCCUR_TIME)
+      time = timestamp.to_time if time?(timestamp)
+      return Timestamp.from_time(time) if time&.between?(MIN_OCCUR_TIME, MAX_OCCUR_TIME)
 
       @log.warn("Ignoring invalid track timestamp #{timestamp.inspect}; expected a Time between 1970 and 9999. " \
                 "Using current time.")
@@ -209,7 +233,7 @@ module Pug
       given = {}
       extras = {}
       properties.each do |key, value|
-        name = self.class.utf8(key.to_s)
+        name = utf8(key.to_s)
         field = schema.by_key[name]
         if field.nil?
           extras[name] = value
@@ -241,17 +265,17 @@ module Pug
 
       case field.type
       when :string
-        return self.class.utf8(value.to_s) if value.is_a?(String) || value.is_a?(Symbol)
+        return utf8(value.to_s) if value.is_a?(String) || value.is_a?(Symbol)
 
-        raise FieldError.new(field.name, "expected string, got #{self.class.type_name(value)}")
+        raise FieldError.new(field.name, "expected string, got #{type_name(value)}")
       when :bool
         return value if [true, false].include?(value)
 
-        raise FieldError.new(field.name, "expected bool, got #{self.class.type_name(value)}")
+        raise FieldError.new(field.name, "expected bool, got #{type_name(value)}")
       when :double, :float
-        return Float(value) if self.class.real_number?(value)
+        return Float(value) if real_number?(value)
 
-        raise FieldError.new(field.name, "expected #{field.type}, got #{self.class.type_name(value)}")
+        raise FieldError.new(field.name, "expected #{field.type}, got #{type_name(value)}")
       when *INTEGER_RANGES.keys
         integer(field.name, field.type, value)
       when :message
@@ -273,8 +297,8 @@ module Pug
                when Integer then value
                when Float then integral_float(name, type, value)
                else
-                 unless self.class.real_number?(value) && value.finite? && value == value.truncate
-                   raise FieldError.new(name, "expected #{type}, got #{self.class.type_name(value)}")
+                 unless real_number?(value) && value.finite? && value == value.truncate
+                   raise FieldError.new(name, "expected #{type}, got #{type_name(value)}")
                  end
 
                  value.to_i
@@ -298,9 +322,9 @@ module Pug
       when Duration then value
       when Hash then duration_from_hash(name, value)
       else
-        unless self.class.real_number?(value)
+        unless real_number?(value)
           raise FieldError.new(name, "expected a Duration (seconds, { seconds:, nanos: } or " \
-                                     "Google::Protobuf::Duration), got #{self.class.type_name(value)}")
+                                     "Google::Protobuf::Duration), got #{type_name(value)}")
         end
         raise FieldError.new(name, "expected a finite number of seconds, got #{value}") unless value.finite?
 
@@ -318,21 +342,16 @@ module Pug
       end
 
       Duration.new(
-        seconds: parts["seconds"].nil? ? 0 : integer("seconds", :int64, parts["seconds"]),
-        nanos: parts["nanos"].nil? ? 0 : integer("nanos", :int32, parts["nanos"])
+        seconds: parts["seconds"].nil? ? 0 : integer("#{name}: seconds", :int64, parts["seconds"]),
+        nanos: parts["nanos"].nil? ? 0 : integer("#{name}: nanos", :int32, parts["nanos"])
       )
-    rescue FieldError => e
-      raise FieldError.new(name, e.to_s)
     end
 
     def known_properties(schema, message)
       schema.fields.each_with_object({}) do |field, out|
-        next if field.descriptor.label == :repeated
+        next if field.descriptor.label == :repeated || !Validator.set?(message, field.descriptor)
 
-        value = field.descriptor.get(message)
-        next unless field.explicit ? field.descriptor.has?(message) : value != field.descriptor.default
-
-        property = known_value(field, value)
+        property = known_value(field, field.descriptor.get(message))
         if property
           out[field.json_name] = property
         else
@@ -356,7 +375,7 @@ module Pug
     def custom_properties(properties, kind)
       properties.each_with_object({}) do |(key, value), out|
         mapped = custom_value(value)
-        out[self.class.utf8(key.to_s)] = mapped if mapped
+        out[utf8(key.to_s)] = mapped if mapped
       rescue NotRepresentable => e
         @log.warn("Property \"#{key}\" on event \"#{kind}\" not representable (#{e.message}), skipping")
       end
@@ -381,17 +400,17 @@ module Pug
     end
 
     def other_value(value)
-      if self.class.time?(value)
+      if time?(value)
         time = value.to_time
         raise NotRepresentable, "#{value} is out of the timestamp range" unless time.getutc.year.between?(1, 9999)
 
-        { timestamp_value: Timestamp.new(seconds: time.to_i, nanos: time.nsec) }
+        { timestamp_value: Timestamp.from_time(time) }
       elsif value.is_a?(Date)
         string_value(value.iso8601)
-      elsif self.class.real_number?(value)
+      elsif real_number?(value)
         double_value(Float(value))
       else
-        raise NotRepresentable, "unsupported type #{self.class.type_name(value)}"
+        raise NotRepresentable, "unsupported type #{type_name(value)}"
       end
     end
 
@@ -402,13 +421,13 @@ module Pug
     end
 
     def json_value(value)
-      string_value(JSON.generate(value))
+      string_value(JSON.generate(self.class.json_ready(value)))
     rescue StandardError => e
       raise NotRepresentable, "not JSON-serializable: #{e.message}"
     end
 
     def string_value(raw)
-      value = self.class.utf8(raw)
+      value = utf8(raw)
       if value.bytesize > MAX_STRING_BYTES
         @log.warn("Property string exceeds #{MAX_STRING_BYTES} bytes, truncating")
         value = value.byteslice(0, MAX_STRING_BYTES).scrub("")
@@ -423,7 +442,7 @@ module Pug
       return {} if location.nil?
 
       unless location.is_a?(Hash)
-        @log.warn("Ignoring location on event \"#{kind}\": expected a Hash, got #{self.class.type_name(location)}")
+        @log.warn("Ignoring location on event \"#{kind}\": expected a Hash, got #{type_name(location)}")
         return {}
       end
       fields = location_fields(location, kind)
@@ -453,10 +472,10 @@ module Pug
 
         unless value.is_a?(String) || value.is_a?(Symbol)
           @log.warn("Ignoring location.#{name} on event \"#{kind}\": expected a String, got " \
-                    "#{self.class.type_name(value)}")
+                    "#{type_name(value)}")
           next
         end
-        trimmed = self.class.utf8(value.to_s).gsub(/\A[[:space:]]+|[[:space:]]+\z/, "")
+        trimmed = utf8(value.to_s).gsub(/\A[[:space:]]+|[[:space:]]+\z/, "")
         next if trimmed.empty?
 
         if name == "country"
@@ -479,9 +498,9 @@ module Pug
         value = fields[name]
         next if value.nil?
 
-        unless self.class.real_number?(value)
+        unless real_number?(value)
           @log.warn("Ignoring location.#{name} on event \"#{kind}\": expected a number, got " \
-                    "#{self.class.type_name(value)}")
+                    "#{type_name(value)}")
           next
         end
         number = Float(value)

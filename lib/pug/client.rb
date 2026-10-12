@@ -21,7 +21,8 @@ module Pug
     IDENTIFY_OPTIONS = %w[anonymous_id device_id].freeze
 
     class NotSerializable < StandardError; end
-    private_constant :NotSerializable
+    OMITTED = Object.new.freeze
+    private_constant :NotSerializable, :OMITTED
 
     attr_reader :profiles, :activity, :insights
 
@@ -29,13 +30,24 @@ module Pug
       unless api_key.is_a?(String) && !api_key.empty?
         raise ArgumentError, "[Pug SDK] api_key is required and must be a non-empty String"
       end
+      # A trailing newline from a secrets file would fail every request.
+      unless api_key.ascii_only? && api_key.match?(/\A[!-~]+\z/)
+        raise ArgumentError, "[Pug SDK] api_key must be printable ASCII without spaces (check for a trailing newline)"
+      end
       unless api_key.start_with?("prv_")
         raise ArgumentError, "[Pug SDK] api_key must be a private key (prv_…) for the server SDK"
       end
       raise ArgumentError, "[Pug SDK] on_error must be callable" unless on_error.nil? || on_error.respond_to?(:call)
+      unless on_error.nil? || takes_two?(on_error)
+        raise ArgumentError, "[Pug SDK] on_error must take two arguments, (error, events)"
+      end
       raise ArgumentError, "[Pug SDK] batch must be a Hash" unless batch.nil? || batch.is_a?(Hash)
+      unless logger.nil? || %i[warn error].all? { |level| logger.respond_to?(level) }
+        raise ArgumentError, "[Pug SDK] logger must respond to warn and error, like a Logger (wrap an IO in Logger.new)"
+      end
 
-      endpoint = endpoint.nil? || endpoint.to_s.empty? ? DEFAULT_ENDPOINT : endpoint.to_s
+      endpoint = endpoint.to_s
+      endpoint = DEFAULT_ENDPOINT if endpoint.empty?
       unless http_url?(endpoint)
         raise ArgumentError, "[Pug SDK] endpoint must be an absolute http(s) URL, got #{endpoint.inspect}"
       end
@@ -52,7 +64,7 @@ module Pug
       @insights = Insights.new(@rpc)
     end
 
-    def track(distinct_id, kind, properties = nil, options = nil)
+    def track(distinct_id, kind, properties = OMITTED, options = nil, **keywords)
       return @log.warn("track() called after close().") if @closed
 
       distinct_id = id_string(distinct_id, "track", "distinct_id")
@@ -62,9 +74,10 @@ module Pug
         return @log.error("track() distinct_id must not start with the reserved '#{RESERVED_PREFIX}' prefix.")
       end
       return @log.error("track() requires a non-empty event kind String.") unless kind?(kind)
+
+      properties, options = split_options(properties, options, keywords, TRACK_OPTIONS, "track")
       return @log.error("track() properties must be a Hash.") unless properties.nil? || properties.is_a?(Hash)
 
-      options = options_hash(options, TRACK_OPTIONS, "track")
       session_id = options["session_id"]
       return @log.error("track() session_id must be a String.") unless session_id.nil? || session_id.is_a?(String)
 
@@ -77,14 +90,16 @@ module Pug
       @log.error("Unexpected error in track(#{kind.inspect}): #{Log.describe(e)}")
     end
 
-    def identify(external_id, traits = nil, options = nil)
+    def identify(external_id, traits = OMITTED, options = nil, **keywords)
       return @log.warn("identify() called after close().") if @closed
 
       external_id = id_string(external_id, "identify", "external_id")
       return if external_id.nil?
+
+      traits, options = split_options(traits, options, keywords, IDENTIFY_OPTIONS, "identify")
       return @log.error("identify() traits must be a Hash.") unless traits.nil? || traits.is_a?(Hash)
 
-      request = identify_request(external_id, traits, options_hash(options, IDENTIFY_OPTIONS, "identify"))
+      request = identify_request(external_id, traits, options)
       return if request.nil?
 
       violations = Validator.validate(request)
@@ -99,15 +114,18 @@ module Pug
     end
 
     def flush(timeout: nil)
-      @batcher.flush(timeout: timeout)
+      @batcher.flush(timeout: wait_timeout(timeout, "flush"))
     end
 
     def close(timeout: nil)
       @closed = true
-      drained = @batcher.close(timeout: timeout)
+      @batcher.close(timeout: wait_timeout(timeout, "close"))
+    ensure
       @connect.close
-      drained
     end
+
+    # The default would print the API key and every buffered event.
+    def inspect = "#<#{self.class.name}>"
 
     private
 
@@ -133,10 +151,29 @@ module Pug
 
     def resolve_timeout(timeout)
       return DEFAULT_TIMEOUT if timeout.nil?
-      return timeout if timeout.is_a?(Numeric) && timeout.real? && timeout.positive? && timeout.finite?
+      return timeout if Connect.timeout?(timeout)
 
       @log.warn("timeout must be a positive number of seconds; using the default #{DEFAULT_TIMEOUT}.")
       DEFAULT_TIMEOUT
+    end
+
+    # A timeout that isn't a number waits without one, as close must still drain; one already
+    # past doesn't wait at all.
+    def wait_timeout(timeout, method)
+      return if timeout.nil? || timeout == Float::INFINITY
+      return [timeout.to_f, 0].max if timeout.is_a?(Numeric) && timeout.real? && timeout.finite?
+
+      @log.warn("#{method}() timeout must be a number of seconds; waiting without one.")
+      nil
+    end
+
+    # Lambdas and methods check their arity, so one taking fewer arguments would fail every call.
+    def takes_two?(callable)
+      callable = callable.method(:call) unless callable.is_a?(Proc) || callable.is_a?(Method)
+      return true if callable.is_a?(Proc) && !callable.lambda?
+
+      arity = callable.arity
+      arity.negative? ? -arity - 1 <= 2 : arity == 2
     end
 
     def http_url?(endpoint)
@@ -170,6 +207,18 @@ module Pug
       (kind.is_a?(String) || kind.is_a?(Symbol)) && !kind.empty?
     end
 
+    # Braceless keywords arrive as one Hash, so track(id, kind, plan: "pro") and
+    # track(id, kind, timestamp: t) look alike. A keyword named after an option sets that option;
+    # any other is data, properties or traits, unless the data came first in an argument of its own.
+    def split_options(data, options, keywords, known, method)
+      named = keywords
+      if data.equal?(OMITTED)
+        named, data = keywords.partition { |key, _| known.include?(key.to_s) }.map(&:to_h)
+        data = nil if data.empty?
+      end
+      [data, options_hash(options, known, method).merge(options_hash(named, known, method))]
+    end
+
     def options_hash(options, known, method)
       return {} if options.nil?
 
@@ -187,9 +236,11 @@ module Pug
     end
 
     # A JSON round trip accepts what JSON does (symbol keys, nested arrays) and refuses what a
-    # Struct can't carry, such as NaN.
+    # Struct can't carry, such as NaN. A Struct's numbers are doubles, so an integer past 2^53
+    # would arrive changed.
     def to_struct(traits)
-      ::Google::Protobuf::Struct.from_hash(JSON.parse(JSON.generate(traits)))
+      ready = EventBuilder.json_ready(traits, max_integer: EventBuilder::MAX_SAFE_FLOAT)
+      ::Google::Protobuf::Struct.from_hash(JSON.parse(JSON.generate(ready)))
     rescue StandardError => e
       raise NotSerializable, e.message
     end

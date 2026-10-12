@@ -16,7 +16,7 @@ module Pug
     USER_AGENT = "pug-ruby/#{VERSION}".freeze
     UNARY_CONTENT_TYPE = "application/proto"
     STREAM_CONTENT_TYPE = "application/connect+proto"
-    CONTENT_TYPE = %r{\Aapplication/(connect\+)?(?:(json)(?:; ?charset=utf-?8)?|(proto))\z}i
+    CONTENT_TYPE = %r{\Aapplication/(?<stream>connect\+)?(?:(?<json>json)(?:; ?charset=utf-?8)?|(?<proto>proto))\z}i
     END_STREAM = 0b10
     COMPRESSED = 0b01
 
@@ -41,6 +41,10 @@ module Pug
     HTTP_CODES = { 400 => :internal, 401 => :unauthenticated, 403 => :permission_denied, 404 => :unimplemented,
                    429 => :unavailable, 502 => :unavailable, 503 => :unavailable, 504 => :unavailable }.freeze
 
+    def self.timeout?(value)
+      value.is_a?(Numeric) && value.real? && value.positive? && value.finite?
+    end
+
     def initialize(endpoint, api_key, timeout:)
       @uri = URI(endpoint)
       @base_path = @uri.path.to_s.chomp("/")
@@ -49,8 +53,8 @@ module Pug
       @pool = Pool.new(@uri)
     end
 
-    def unary(procedure, request, response_class, timeout: @timeout)
-      response = call(procedure, request.class.encode(request), UNARY_CONTENT_TYPE, timeout) do |http, post|
+    def unary(procedure, request, response_class)
+      response = call(procedure, request.class.encode(request), UNARY_CONTENT_TYPE, @timeout) do |http, post|
         http.request(post)
       end
       raise unary_error(response) unless response.code == "200"
@@ -59,12 +63,14 @@ module Pug
       decode(response_class, response.body.to_s)
     end
 
-    def server_stream(procedure, request, response_class, timeout: @timeout)
+    # The deadline covers the whole stream, including the time the caller's block takes.
+    def server_stream(procedure, request, response_class, timeout: nil)
+      timeout ||= @timeout
       body = envelope(0, request.class.encode(request))
       deadline = monotonic + timeout
       call(procedure, body, STREAM_CONTENT_TYPE, timeout) do |http, post|
         http.request(post) do |response|
-          raise Error.new("HTTP #{response.code}", code: http_code(response.code.to_i)) unless response.code == "200"
+          raise http_error(response) unless response.code == "200"
 
           check_content_type(response, stream: true)
           check_stream_encoding(response)
@@ -82,6 +88,9 @@ module Pug
       @pool.close
     end
 
+    # The default would print the API key.
+    def inspect = "#<#{self.class.name}>"
+
     private
 
     def call(procedure, body, content_type, timeout)
@@ -93,8 +102,6 @@ module Pug
       post["X-Api-Key"] = @api_key
       post.body = body
       @pool.with(timeout) { |http| yield http, post }
-    rescue Error
-      raise
     rescue Timeout::Error => e
       raise Error.new("request timed out: #{e.message}", code: :deadline_exceeded)
     rescue SocketError, SystemCallError, IOError, OpenSSL::SSL::SSLError => e
@@ -140,17 +147,16 @@ module Pug
     end
 
     def end_stream(data)
+      invalid = Error.new("invalid end stream", code: :unknown)
       parsed = parse_json(data)
-      raise Error.new("invalid end stream", code: :unknown) unless parsed.is_a?(Hash)
-      return if parsed["error"].nil?
-
-      raise wire_error(parsed["error"], Error.new("invalid end stream", code: :unknown))
+      raise invalid unless parsed.is_a?(Hash)
+      raise wire_error(parsed["error"], invalid) unless parsed["error"].nil?
     end
 
     def unary_error(response)
-      fallback = Error.new("HTTP #{response.code}", code: http_code(response.code.to_i))
+      fallback = http_error(response)
       match = CONTENT_TYPE.match(response["Content-Type"].to_s)
-      return fallback unless match && match[2]
+      return fallback unless match && match[:json]
 
       wire_error(parse_json(response.body.to_s), fallback)
     end
@@ -173,7 +179,7 @@ module Pug
     def check_content_type(response, stream:)
       type = response["Content-Type"].to_s
       match = CONTENT_TYPE.match(type)
-      return if match && match[3] && !match[1] == !stream
+      return if match && match[:proto] && !match[:stream] == !stream
 
       raise Error.new("unsupported content type #{type}", code: match ? :internal : :unknown)
     end
@@ -195,8 +201,20 @@ module Pug
       [flags, data.bytesize].pack("CN") + data
     end
 
-    def http_code(status)
-      HTTP_CODES.fetch(status, :unknown)
+    # Net::HTTP doesn't follow redirects, so one means the endpoint is misconfigured, as a 404
+    # does: unimplemented, which nothing retries. A proxy may have answered instead of a Connect
+    # server, so the status gets the redirect target or the start of the body.
+    def http_error(response)
+      status = response.code.to_i
+      redirect = (300..399).cover?(status)
+      detail = redirect ? response["Location"]&.then { |url| "redirected to #{url}" } : snippet(response.body)
+      code = redirect ? :unimplemented : HTTP_CODES.fetch(status, :unknown)
+      Error.new(["HTTP #{status}", detail].compact.join(": "), code: code)
+    end
+
+    def snippet(body)
+      text = body.to_s.byteslice(0, 512).force_encoding(Encoding::UTF_8).scrub("").gsub(/\s+/, " ").strip
+      text[0, 120] unless text.empty?
     end
 
     def monotonic
@@ -230,7 +248,10 @@ module Pug
       end
 
       def close
-        connections = @lock.synchronize { @idle.slice!(0..) }
+        connections = @lock.synchronize do
+          forked
+          @idle.slice!(0..)
+        end
         connections.each { |http| discard(http) }
       end
 

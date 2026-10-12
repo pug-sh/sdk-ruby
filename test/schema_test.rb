@@ -30,13 +30,13 @@ class WellKnownCatalogTest < Minitest::Test
     seen = {}
     namespace.constants.map { |name| namespace.const_get(name) }.grep(Class).each do |klass|
       options = klass.descriptor.options
-      kind = Pug::Proto::Options.string(options, Pug::WellKnown::KIND)
-      next if kind.nil?
+      next unless Pug::WellKnown::KIND.has?(options)
 
+      kind = Pug::WellKnown::KIND.get(options)
       refute seen.key?(kind), "kind #{kind} is on both #{seen[kind]} and #{klass.descriptor.name}"
       seen[kind] = klass.descriptor.name
-      platforms = Pug::Proto::Options.enums(options, Pug::WellKnown::PLATFORMS)
-      refute_includes platforms, namespace::Platform::PLATFORM_UNSPECIFIED, "#{klass.descriptor.name} lists UNSPECIFIED"
+      refute_includes Pug::WellKnown::PLATFORMS.get(options), :PLATFORM_UNSPECIFIED,
+                      "#{klass.descriptor.name} lists UNSPECIFIED"
     end
     assert_operator seen.size, :>, Pug::WellKnown::CATALOG.size
   end
@@ -150,6 +150,51 @@ class ValidatorTest < Minitest::Test
     )
     assert_equal 'custom_properties["s"].value: exactly one field is required in oneof [required]',
                  V.format(V.validate(event))
+  end
+
+  # TimestampRules has no in/not_in, and lt_now/gt_now/within compare with the clock, so they are
+  # reported, as anything a schema adopts that the validator can't evaluate must be.
+  def test_reports_timestamp_rules_instead_of_crashing
+    [{ gt: { seconds: 0 } }, { lt_now: true }].each do |timestamp|
+      rules = Rules::FieldRules.new(timestamp: timestamp)
+      assert_equal ["timestamp"], V.unsupported_field_rules(rules, :single)
+      assert_empty V.field_checks(rules)
+    end
+  end
+
+  def test_required_on_a_list_or_map_whose_elements_have_no_rules
+    message = required_collections
+    assert_equal ["tags: value is required [required]", "items: value is required [required]",
+                  "attrs: value is required [required]"], V.validate(message.new).map(&:to_s)
+    assert_empty V.validate(message.new(tags: ["a"], items: [{ x: "y" }], attrs: { "k" => "v" }))
+    assert_empty V.unsupported_rules(message.descriptor)
+  end
+
+  def required_collections
+    pool = Google::Protobuf::DescriptorPool.generated_pool
+    name = "pug_test.RequiredCollections"
+    return pool.lookup(name).msgclass if pool.lookup(name)
+
+    required = Google::Protobuf::FieldOptions.new
+    V::FIELD_RULES.set(required, Rules::FieldRules.new(required: true))
+    entry = { name: "AttrsEntry", options: { map_entry: true },
+              field: [{ name: "key", number: 1, type: :TYPE_STRING, label: :LABEL_OPTIONAL },
+                      { name: "value", number: 2, type: :TYPE_STRING, label: :LABEL_OPTIONAL }] }
+    repeated = { label: :LABEL_REPEATED, options: required }
+    file = Google::Protobuf::FileDescriptorProto.new(
+      name: "pug_test/required_collections.proto", package: "pug_test", syntax: "proto3",
+      message_type: [
+        { name: "Plain", field: [{ name: "x", number: 1, type: :TYPE_STRING, label: :LABEL_OPTIONAL }] },
+        { name: "RequiredCollections", nested_type: [entry], field: [
+          { name: "tags", number: 1, type: :TYPE_STRING, **repeated },
+          { name: "items", number: 2, type: :TYPE_MESSAGE, type_name: ".pug_test.Plain", **repeated },
+          { name: "attrs", number: 3, type: :TYPE_MESSAGE, type_name: ".pug_test.RequiredCollections.AttrsEntry",
+            **repeated }
+        ] }
+      ]
+    )
+    pool.add_serialized_file(Google::Protobuf::FileDescriptorProto.encode(file))
+    pool.lookup(name).msgclass
   end
 
   def test_skips_messages_without_rules

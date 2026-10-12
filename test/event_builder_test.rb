@@ -4,27 +4,35 @@ require_relative "test_helper"
 require "bigdecimal"
 require "date"
 
-class EventBuilderTest < Minitest::Test
+module EventBuilding
   include Pug::TestSupport
 
-  SESSION = UUID
-  PURCHASE = { product_id: "p1", amount: 9.99, currency: "USD", quantity: 2 }.freeze
-  BASE_KEYS = %w[$lib $platform $sdkVersion].freeze
-
+  # Keyword-free, so a braceless Hash is the properties: build("my.custom", plan: "pro").
   def build(kind, properties = nil)
-    event, = Pug::EventBuilder.new(Pug::Log.new(logs)).build(kind, SESSION, "user_1", properties)
+    build_with(kind, properties)
+  end
+
+  def build_with(kind, properties, session_id: UUID, **)
+    event, = Pug::EventBuilder.new(Pug::Log.new(logs)).build(kind, session_id, "user_1", properties, **)
     event
   end
 
-  def custom(event, key)
-    value = event.custom_properties[key]
+  def property(properties, key)
+    value = properties[key]
     value && [value.value, value.public_send(value.value)]
   end
 
-  def auto(event, key)
-    value = event.auto_properties[key]
-    value && [value.value, value.public_send(value.value)]
+  def custom(event, key)
+    property(event.custom_properties, key)
   end
+
+  def auto(event, key)
+    property(event.auto_properties, key)
+  end
+end
+
+class EventBuilderTest < Minitest::Test
+  include EventBuilding
 
   def test_maps_property_types_into_the_custom_properties_oneof
     event = build("my.custom", amount: 5, ratio: 1.5, ok: true, name: "hello", when: Time.at(0))
@@ -43,12 +51,11 @@ class EventBuilderTest < Minitest::Test
     assert_equal [:string_value, Pug::VERSION], auto(event, "$sdkVersion")
     assert_equal [:string_value, "server"], auto(event, "$platform")
     assert_match(/\A\h{8}-\h{4}-7\h{3}-\h{4}-\h{12}\z/, event.event_id)
-    assert_equal SESSION, event.session_id
+    assert_equal UUID, event.session_id
   end
 
   def test_drops_an_event_failing_validation
-    event, = Pug::EventBuilder.new(Pug::Log.new(logs)).build("my.custom", "not-a-uuid", "user_1")
-    assert_nil event
+    assert_nil build_with("my.custom", nil, session_id: "not-a-uuid")
     assert_match(/failed Event-level validation: session_id: value must be a valid UUID/, logs.errors.last)
   end
 
@@ -73,6 +80,25 @@ class EventBuilderTest < Minitest::Test
     event = build("my.custom", gone: nil, kept: 1)
     assert_equal %w[kept], event.custom_properties.keys
     assert_empty logs.warnings
+  end
+
+  def test_sends_zero_values
+    event = build("my.custom", off: false, zero: 0, none: 0.0, blank: "", negative: -5)
+    assert_equal({ "off" => false, "zero" => 0, "none" => 0.0, "blank" => "", "negative" => -5 },
+                 event.custom_properties.keys.to_h { |key| [key, custom(event, key).last] })
+  end
+
+  def test_keeps_the_int64_extremes_and_drops_just_past_them
+    event = build("my.custom", max: (2**63) - 1, min: -(2**63), over: 2**63, under: -(2**63) - 1)
+    assert_equal [[:int_value, -(2**63)], [:int_value, (2**63) - 1]], [custom(event, "min"), custom(event, "max")]
+    assert_equal %w[max min], event.custom_properties.keys.sort
+    assert_equal 2, logs.warnings.grep(/overflows int64/).size
+  end
+
+  def test_drops_a_time_outside_the_timestamp_range
+    event = build("my.custom", far: Time.utc(10_000), ok: 1)
+    assert_equal %w[ok], event.custom_properties.keys
+    assert_match(/"far" .* out of the timestamp range/, logs.warnings.last)
   end
 
   def test_maps_ruby_values_by_type
@@ -133,9 +159,18 @@ class EventBuilderTest < Minitest::Test
   def test_a_value_that_is_not_json_serializable_is_skipped
     cyclic = []
     cyclic << cyclic
-    event = build("my.custom", cyclic: cyclic, nan: { x: Float::NAN }, ok: 1)
+    event = build("my.custom", cyclic: cyclic, nan: { x: Float::NAN }, set: [Set[1]], ok: 1)
     assert_equal %w[ok], event.custom_properties.keys
-    assert_equal 2, logs.warnings.grep(/not JSON-serializable/).size
+    assert_equal 3, logs.warnings.grep(/not JSON-serializable/).size
+    assert_match(/Set has no JSON form/, logs.warnings.last)
+  end
+
+  # JSON.generate alone would write each of these as its to_s: "1970-01-01 00:00:00 UTC", "0.15e1".
+  def test_maps_nested_values_as_it_would_on_their_own
+    event = build("my.custom", nested: { at: Time.at(0).utc, on: Date.new(2026, 10, 12), price: BigDecimal("1.5"),
+                                         plan: :pro, 1 => [nil] })
+    assert_equal '{"at":"1970-01-01T00:00:00.000Z","on":"2026-10-12","price":1.5,"plan":"pro","1":[null]}',
+                 custom(event, "nested").last
   end
 
   def test_a_kind_named_like_an_object_method_is_a_custom_event
@@ -156,19 +191,9 @@ class EventBuilderTest < Minitest::Test
 end
 
 class WellKnownEventTest < Minitest::Test
-  include Pug::TestSupport
+  include EventBuilding
 
-  PURCHASE = EventBuilderTest::PURCHASE
-
-  def build(kind, properties = nil)
-    event, = Pug::EventBuilder.new(Pug::Log.new(logs)).build(kind, UUID, "user_1", properties)
-    event
-  end
-
-  def custom(event, key)
-    value = event.custom_properties[key]
-    value && [value.value, value.public_send(value.value)]
-  end
+  PURCHASE = { product_id: "p1", amount: 9.99, currency: "USD", quantity: 2 }.freeze
 
   def test_maps_known_fields_through_their_proto_type
     event = build("purchase", amount: 9.99, quantity: 2, currency: "USD")
@@ -242,6 +267,17 @@ class WellKnownEventTest < Minitest::Test
     assert_match(/product_id: value is required \[required\]/, logs.errors.last)
   end
 
+  def test_drops_the_event_when_a_double_is_not_finite
+    assert_nil build("purchase", PURCHASE.merge(amount: Float::INFINITY))
+    assert_match(/custom_properties\["amount"\]\.double_value: value must be finite \[double\.finite\]/,
+                 logs.errors.last)
+  end
+
+  def test_sends_a_false_bool_field
+    event = build("error_occurred", error_code: "E1", unhandled: false)
+    assert_equal [:bool_value, false], custom(event, "unhandled")
+  end
+
   def test_sends_int64_fields_as_ints
     assert_equal [:int_value, 1024], custom(build("file_uploaded", file_id: "f1", size_bytes: 1024), "sizeBytes")
     assert_equal [:int_value, 2**53], custom(build("file_uploaded", file_id: "f1", size_bytes: 2**53), "sizeBytes")
@@ -291,7 +327,7 @@ class WellKnownEventTest < Minitest::Test
   ].each_with_index do |(position, message), i|
     define_method("test_drops_the_event_when_a_duration_is_invalid_#{i}") do
       assert_nil build("video_play", video_id: "v1", position: position)
-      assert_match("position: #{message}", logs.errors.last)
+      assert logs.errors.last.end_with?("\": position: #{message}"), logs.errors.last
     end
   end
 
@@ -318,51 +354,49 @@ class WellKnownEventTest < Minitest::Test
 end
 
 class OccurTimeTest < Minitest::Test
-  include Pug::TestSupport
+  include EventBuilding
 
-  def build(timestamp)
-    event, = Pug::EventBuilder.new(Pug::Log.new(logs)).build("my.custom", UUID, "user_1", nil, timestamp: timestamp)
-    event
+  def occur_time(timestamp)
+    build_with("my.custom", nil, timestamp: timestamp).occur_time
   end
 
   def test_honors_an_explicit_time
-    event = build(Time.at(1_700_000_000, 123_456_789, :nsec))
-    assert_equal 1_700_000_000, event.occur_time.seconds
-    assert_equal 123_456_789, event.occur_time.nanos
+    time = occur_time(Time.at(1_700_000_000, 123_456_789, :nsec))
+    assert_equal 1_700_000_000, time.seconds
+    assert_equal 123_456_789, time.nanos
   end
 
   # Regression guard from sdk-node: the epoch is a real timestamp, not "unset".
   def test_keeps_the_epoch
-    assert_equal 0, build(Time.at(0)).occur_time.seconds
+    assert_equal 0, occur_time(Time.at(0)).seconds
   end
 
   def test_accepts_a_datetime
-    assert_equal 1_700_000_000, build(Time.at(1_700_000_000).to_datetime).occur_time.seconds
+    assert_equal 1_700_000_000, occur_time(Time.at(1_700_000_000).to_datetime).seconds
   end
 
   def test_falls_back_to_now_with_a_warning_for_an_out_of_range_or_non_time_value
     [Time.at(-1), Time.utc(10_000), 1_700_000_000_000, "2026-10-10"].each do |timestamp|
       logs.clear
       now = Time.now.to_i
-      event = build(timestamp)
+      seconds = occur_time(timestamp).seconds
       assert_match(/Ignoring invalid track timestamp/, logs.warnings.last)
-      assert_in_delta now, event.occur_time.seconds, 60
+      assert_in_delta now, seconds, 60
     end
   end
 end
 
 class LocationTest < Minitest::Test
-  include Pug::TestSupport
+  include EventBuilding
 
-  BASE_KEYS = EventBuilderTest::BASE_KEYS
+  BASE_KEYS = %w[$lib $platform $sdkVersion].freeze
 
   def location(value)
-    event, = Pug::EventBuilder.new(Pug::Log.new(logs)).build("my.custom", UUID, "user_1", nil, location: value)
-    event.auto_properties
+    build_with("my.custom", nil, location: value).auto_properties
   end
 
   def value(properties, key)
-    properties[key]&.then { |property| property.public_send(property.value) }
+    property(properties, key)&.last
   end
 
   def test_renders_every_field_as_a_geo_auto_property

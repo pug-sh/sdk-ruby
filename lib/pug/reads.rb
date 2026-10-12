@@ -43,11 +43,22 @@ module Pug
       unary(:profiles_delete, { id: id })
     end
 
-    # Auto-paginating: the server streams the pages of one request.
-    def list(request = nil, &block)
-      return enum_for(:list, request) unless block
+    # Auto-paginating: the server streams the pages of one request. The deadline covers the whole
+    # stream, the block's time included; timeout (seconds) overrides the client's. Keywords other
+    # than timeout are the request, given braceless.
+    def list(request = nil, timeout: nil, **fields, &block)
+      return enum_for(:list, request, timeout: timeout, **fields) unless block
 
-      Reads.call { @rpc.stream(:profiles_list, request) { |page| page.profiles.each(&block) } }
+      Reads.call do
+        if request && fields.any?
+          raise ArgumentError, "list takes a request or keywords, not both: #{fields.keys.inspect}"
+        end
+        unless timeout.nil? || Connect.timeout?(timeout)
+          raise ArgumentError, "timeout must be a positive number of seconds, got #{timeout.inspect}"
+        end
+
+        @rpc.stream(:profiles_list, request || fields, timeout: timeout) { |page| page.profiles.each(&block) }
+      end
     end
 
     private

@@ -56,10 +56,11 @@ pug.close
   anything invalid. `track` is non-blocking: a background thread sends events in batches, by size
   (`max_size`) or interval (`max_wait`).
 - **Delivery is best-effort with retry.** A transient send failure keeps events queued and retries
-  after `max_wait`; a permanent one (a fixed set of client-error Connect codes, plus any
-  non-transport error) dead-letters them via `on_error`. `close` drains and reports anything still
-  undelivered through `on_error`. `on_error` covers buffered `track` events only — `identify`
-  failures are logged.
+  `max_wait` after the failure, but no sooner than a second; a permanent one (a fixed set of
+  client-error Connect codes, plus any non-transport error) dead-letters them via `on_error`.
+  `close` drains and reports anything still undelivered through `on_error` and the log.
+  `on_error` covers buffered `track` events only — `identify` failures are logged, and so are
+  events the server drops from a batch it accepts (`BatchCreateResponse.dropped`), at WARN.
 - **Reads are request/response and do raise** `Pug::Error` — they run in your control flow, so
   you own retry. They are not auto-retried.
 - **Well-known events** have typed, validated properties; any other `kind` is accepted as a
@@ -72,14 +73,14 @@ pug.close
 
 ### `Pug::Client.new(**options)`
 
-| Option     | Type                    | Default          | Description                                                                                                       |
-| ---------- | ----------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `api_key`  | `String`                | —                | **Required.** Private project key (`prv_…`).                                                                      |
-| `endpoint` | `String`                | hosted endpoint  | Pug server origin.                                                                                                |
-| `batch`    | `Hash`                  | see below        | Ingestion buffer: `max_size` (100, capped at 1000), `max_wait` (5 seconds), `max_queue_size` (10,000).            |
-| `on_error` | callable                | none             | Dead-letter hook for undeliverable buffered `track` events (`identify` failures are logged, not routed here).      |
-| `logger`   | `Logger`-like           | `$stderr`, WARN  | Receives the SDK's warnings and errors (anything with `warn` and `error`, such as `Rails.logger`).                |
-| `timeout`  | `Numeric`               | 10               | Request timeout, in seconds.                                                                                      |
+| Option     | Type          | Default                     | Description                                                                                                                       |
+| ---------- | ------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `api_key`  | `String`      | —                           | **Required.** Private project key (`prv_…`).                                                                                      |
+| `endpoint` | `String`      | hosted endpoint             | Pug server origin.                                                                                                                |
+| `batch`    | `Hash`        | see below                   | Ingestion buffer: `max_size` (100, capped at 1000), `max_wait` (5 seconds), `max_queue_size` (10,000).                            |
+| `on_error` | callable      | none                        | Dead-letter hook for undeliverable buffered `track` events, called with `(error, events)`.                                        |
+| `logger`   | `Logger`-like | `Logger.new($stderr)`, WARN | Gets the SDK's warnings and errors: anything with public `warn` and `error`, such as `Rails.logger` (wrap an IO in `Logger.new`). |
+| `timeout`  | `Numeric`     | 10                          | Request timeout, in seconds.                                                                                                      |
 
 ```ruby
 Pug::Client.new(
@@ -87,15 +88,18 @@ Pug::Client.new(
   batch: { max_size: 100, max_wait: 5, max_queue_size: 10_000 },
   on_error: lambda do |error, events|
     # dead-letter sink: error is a Pug::QueueOverflowError, a Pug::ClosedError, a Pug::Error
-    # with a permanent Connect code, or the exception a bug raised
+    # with a permanent Connect code, the transient Pug::Error that failed close's last attempt,
+    # or the exception a bug raised
   end,
 )
 ```
 
-`on_error` runs on the background sender thread, on the thread calling `close` for what it reports
-undelivered, or on the thread that called `track` when the queue overflows. It must be thread-safe
-and return promptly; `flush` and `close` called from inside it return `false` at once instead of
-waiting.
+`on_error` runs on the background sender thread; on the thread calling `close`, for what it
+reports undelivered; or, when the queue overflows, on the thread that called `track`. It must be
+thread-safe and return promptly. Called from inside it on the sender or the closing thread, `flush`
+and `close` don't wait for what is waiting on `on_error`: they return `false` at once, except that
+`flush` returns `true` while `close` reports. On the overflow path nothing waits on `on_error`, so
+they behave as anywhere else, blocking the thread that called `track`.
 
 ### Ingestion (never raises)
 
@@ -103,22 +107,32 @@ waiting.
 - `pug.identify(external_id, traits = nil, options = nil)` — create or update a profile. Blocks
   until the server answers.
 - `pug.flush(timeout: nil)` — send the currently buffered events now and wait for that attempt.
-  Returns `false` if `timeout` (seconds) passed first.
+  Returns `false` if `timeout` (seconds) passed first. `true` means the attempt finished, not that
+  every event was delivered: a transient failure keeps them queued for a retry.
 - `pug.close(timeout: nil)` — drain and shut down; call on graceful exit so nothing buffered is lost.
-  Returns `false` if `timeout` passed first; events still undelivered then go to `on_error`.
+  Returns `false` if `timeout` passed first. Either way, by the time it returns every event it
+  couldn't send has gone to `on_error` and the log, including a batch still being sent when the
+  timeout ran out, which may yet arrive.
 
-Ids are non-empty Strings (an Integer id, such as a record's, is sent as its decimal string).
-Properties go in a Hash, braces optional when there are no options:
+A `timeout` that isn't a number waits without one, with a warning.
+
+`distinct_id` and `external_id` are non-empty Strings, or Integers such as a record's id, sent as
+their decimal string; `session_id`, `anonymous_id` and `device_id` must be Strings. Properties go
+in a Hash, braces optional, and options follow as keywords. Without braces, a key named after an
+option sets that option, so a property with an option's name needs the braces:
 
 ```ruby
 pug.track(user.id, "signup", plan: "pro")
-pug.track(user.id, "signup", { plan: "pro" }, timestamp: signed_up_at, location: { country: "DE" })
+pug.track(user.id, "signup", plan: "pro", timestamp: signed_up_at)
+pug.track(user.id, "signup", { plan: "pro", location: "landing" }, location: { country: "DE" })
 ```
 
 `track` options: `timestamp` (a `Time`; defaults to now), `session_id` (a UUID overriding the
 client's per-instance session), `location` (the visitor's location — see below).
-`identify` options: `anonymous_id` (must start with `anon-`; triggers anon→identified merge),
-`device_id`. Traits must be JSON-serializable.
+`identify` options, which work the same way with traits: `anonymous_id` (must start with `anon-`;
+triggers anon→identified merge), `device_id`. Traits must be JSON-serializable, with nested values
+mapped as for properties below; they travel as a protobuf `Struct`, whose numbers are doubles, so
+an integer past 2^53 is refused.
 
 Custom properties map by Ruby type:
 
@@ -134,8 +148,10 @@ Custom properties map by Ruby type:
 | `Hash`, `Array`                                  | JSON string                               |
 | `nil`                                            | omitted                                   |
 
-Anything else is dropped with a warning. Strings are capped at 1024 bytes (truncated with a
-warning), and invalid UTF-8 is repaired.
+Anything else is dropped with a warning. Inside a `Hash` or `Array`, a `Time`, `DateTime` or `Date`
+becomes an ISO 8601 string and a `BigDecimal` or `Rational` a number, while a value JSON has no
+form for, such as a `Set`, drops the whole property with a warning. Strings are capped at 1024
+bytes (truncated with a warning), and invalid UTF-8 is repaired.
 
 ### Well-known events
 
@@ -176,8 +192,9 @@ the rest is still sent. If nothing is usable the event goes out with no geo.
 These run in your control flow:
 
 - `pug.profiles` — `get(id, include_bots: false)`, `get_by_external_id(external_id, include_bots: false)`,
-  `delete(id)`, `list(request = nil)` (auto-paginating: yields each profile to a block, or returns
-  an `Enumerator`).
+  `delete(id)`, `list(request = nil, timeout: nil)` (auto-paginating: yields each profile to a
+  block, or returns an `Enumerator`). The timeout bounds the whole stream, the time your block
+  takes included, so `timeout:` (seconds) can give one long `list` more than the client's.
 - `pug.activity` — `feed`, `event_explorer`, `heatmap`, `profile_sessions`, `profile_stats`,
   `filter_schema`, `property_values`.
 - `pug.insights` — `query`, `segment_users`, `filter_schema`, `property_values`.
@@ -192,10 +209,14 @@ sessions.sessions.each { |s| puts s.session_id }
 ```
 
 Reads leave out traffic tagged as a bot at ingest unless you ask for it: pass
-`include_bots: true` to `profiles.get` and `get_by_external_id`, or set it on the request.
+`include_bots: true` to `profiles.get` and `get_by_external_id`, or set it on the request of
+`profiles.list` or of an `activity` read other than `filter_schema` and `property_values`. The
+other requests have no such field.
 
 `Pug::Error#code` is the Connect code as a Symbol (`:not_found`, `:unavailable`, …), or `nil`
-when the failure didn't come from the RPC layer; `cause` is the underlying exception.
+when the failure didn't come from the RPC layer; `cause` is the underlying exception. The SDK
+doesn't follow redirects, so one is `:unimplemented`, like a wrong path: point `endpoint` at the
+final URL.
 
 ```ruby
 begin

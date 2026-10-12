@@ -132,6 +132,81 @@ class ConnectTest < Minitest::Test
     assert_equal 1, @server.instance_variable_get(:@connections).size
   end
 
+  def test_concurrent_reads_never_share_a_connection
+    serve do |request|
+      sleep 0.02
+      id = ProfilesV1::GetRequest.decode(request.body).id
+      ok(ProfilesV1::GetResponse.new(profile: { id: id }))
+    end
+    pug = client
+    pug.profiles.get("warm")
+    ids = Array.new(8) { |i| "p#{i}" }
+    assert_equal ids, ids.map { |id| Thread.new { pug.profiles.get(id).id } }.map(&:value)
+  end
+
+  def test_a_forked_child_dials_its_own_connection
+    skip "fork is unavailable" unless Process.respond_to?(:fork)
+
+    serve { [200, PROTO, ""] }
+    pug = client
+    pug.activity.filter_schema
+    pid = fork do
+      pug.activity.filter_schema
+      exit!(0)
+    rescue Exception # rubocop:disable Lint/RescueException
+      exit!(1)
+    end
+    assert Process.wait2(pid).last.success?
+    pug.activity.filter_schema
+    assert_equal 2, @server.instance_variable_get(:@connections).size
+  end
+
+  # Over TLS, finishing an inherited connection writes close_notify into the parent's session.
+  def test_a_forked_childs_close_leaves_the_parents_connections_alone
+    skip "fork is unavailable" unless Process.respond_to?(:fork)
+
+    serve { [200, PROTO, ""] }
+    pug = client
+    pug.activity.filter_schema
+    inherited = pug.instance_variable_get(:@connect).instance_variable_get(:@pool).instance_variable_get(:@idle).first
+    reader, writer = IO.pipe
+    pid = fork do
+      reader.close
+      pug.close(timeout: 1)
+      writer.puts(inherited.started?)
+      exit!(0)
+    end
+    writer.close
+    Process.wait(pid)
+    assert_equal "true", reader.read.chomp, "the child finished a connection its parent still uses"
+  end
+
+  def test_maps_every_http_status_to_a_connect_code
+    table = { 301 => :unimplemented, 400 => :internal, 401 => :unauthenticated, 403 => :permission_denied,
+              404 => :unimplemented, 429 => :unavailable, 500 => :unknown, 502 => :unavailable, 503 => :unavailable,
+              504 => :unavailable }
+    statuses = table.keys
+    serve { [statuses.shift, { "Content-Type" => "text/plain" }, "nope"] }
+    pug = client
+    table.each do |status, code|
+      assert_equal code, assert_raises(Pug::Error) { pug.activity.filter_schema }.code, "HTTP #{status}"
+    end
+  end
+
+  # Without a Connect error body, the status alone would leave a proxy's answer a mystery.
+  def test_an_error_without_a_connect_body_says_what_answered
+    responses = [[308, { "Location" => "https://pug.example.com/x" }, ""],
+                 [413, { "Content-Type" => "text/html" }, "<html>\n  <title>413 Request Entity Too Large</title>"],
+                 [502, {}, "x" * 500]]
+    serve { responses.shift }
+    pug = client
+    ["unimplemented: HTTP 308: redirected to https://pug.example.com/x",
+     "unknown: HTTP 413: <html> <title>413 Request Entity Too Large</title>",
+     "unavailable: HTTP 502: #{"x" * 120}"].each do |message|
+      assert_equal message, assert_raises(Pug::Error) { pug.activity.filter_schema }.message
+    end
+  end
+
   def test_read_errors_carry_the_connect_code
     responses = [
       error_json(404, "not_found", "no such profile"),
@@ -147,9 +222,9 @@ class ConnectTest < Minitest::Test
     pug = client
     expected = [
       [:not_found, "not_found: no such profile"],
-      [:unavailable, "unavailable: HTTP 503"],
+      [:unavailable, "unavailable: HTTP 503: <html>down</html>"],
       [:internal, "internal: HTTP 400"],
-      [:unknown, "unknown: HTTP 500"],
+      [:unknown, "unknown: HTTP 500: {not json"],
       [:unknown, "unknown: odd"],
       [:unknown, "unknown: unsupported content type text/html"],
       [:internal, "internal: unsupported content type application/json"],
@@ -163,11 +238,9 @@ class ConnectTest < Minitest::Test
   end
 
   def test_an_unreachable_server_is_unavailable
-    @server = FakeServer.new { [200, PROTO, ""] }
-    url = @server.url
+    serve { [200, PROTO, ""] }
     @server.close
-    @client = Pug::Client.new(api_key: "prv_test", endpoint: url, logger: logs)
-    error = assert_raises(Pug::Error) { @client.activity.filter_schema }
+    error = assert_raises(Pug::Error) { client.activity.filter_schema }
     assert_equal :unavailable, error.code
   end
 
@@ -259,6 +332,48 @@ class ConnectTest < Minitest::Test
     end
     error = assert_raises(Pug::Error) { client(timeout: 0.3).profiles.list.to_a }
     assert_equal :deadline_exceeded, error.code
+  end
+
+  # Each page arrives well within the timeout, but the stream as a whole doesn't.
+  def test_a_trickling_stream_is_bounded_as_a_whole
+    page = ProfilesV1::ListResponse.encode(ProfilesV1::ListResponse.new(profiles: [{ id: "a" }]))
+    serve { [200, STREAM, Array.new(10) { [envelope(0, page), -> { sleep 0.1 }] }.flatten(1) << envelope(2, "{}")] }
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    error = assert_raises(Pug::Error) { client(timeout: 0.3).profiles.list.to_a }
+    assert_equal :deadline_exceeded, error.code
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 0.9
+  end
+
+  def test_a_list_timeout_covers_the_callers_block
+    pages = Array.new(3) { |i| ProfilesV1::ListResponse.new(profiles: [{ id: "p#{i}" }]) }
+    serve { stream_response(*pages) }
+    pug = client(timeout: 0.2)
+    seen = []
+    slow = lambda do |profile|
+      seen << profile.id
+      sleep 0.15
+    end
+    assert_equal :deadline_exceeded, assert_raises(Pug::Error) { pug.profiles.list(&slow) }.code
+    assert_operator seen.size, :<, 3
+    seen.clear
+    pug.profiles.list(timeout: 5, &slow)
+    assert_equal %w[p0 p1 p2], seen
+    assert_equal(%w[200 5000], @server.requests.map { |request| request.headers["connect-timeout-ms"] })
+  end
+
+  # Most of the way from an HTTP status to a dead letter or a retry.
+  def test_dead_letters_or_retries_by_status
+    { 401 => true, 403 => true, 404 => true, 308 => true, 400 => false, 429 => false, 500 => false,
+      503 => false }.each do |status, permanent|
+      serve { [status, {}, ""] }
+      failures = Queue.new
+      pug = client(on_error: ->(error, _) { failures << error })
+      pug.track("u", "my.custom")
+      pug.flush(timeout: 5)
+      assert_equal permanent, !failures.empty?, "HTTP #{status}"
+      teardown
+    end
+    @client = @server = nil
   end
 
   def test_a_permanent_failure_dead_letters

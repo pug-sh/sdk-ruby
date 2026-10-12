@@ -51,9 +51,8 @@ same `.proto` file.
 
 Like sdk-go, there is no generated registry: `lib/pug/well_known.rb` builds the catalog at load
 from the `(common.events.v1.kind)` option of the generated `Pug::Proto::Common::Events::V1`
-messages. Ruby's protobuf has no extension API, so custom options survive only as unknown fields
-of a descriptor's options; `Pug::Proto::Options` re-encodes the options message and reads them
-back off the wire.
+messages. Custom options are extensions, read off a descriptor's options through
+google-protobuf's extension API (`Pug::Proto.extension("common.events.v1.kind").get(options)`).
 
 - **Filter policy** (same as sdk-node): an event is well-known here if its
   `(common.events.v1.platforms)` option contains `PLATFORM_SERVER` **or** is unset.
@@ -65,9 +64,10 @@ back off the wire.
 
 There is no protovalidate for Ruby, so `lib/pug/validator.rb` implements the part the SDK's
 schemas use, driven by the `buf.validate` rules decoded from the descriptors: `required`, oneof
-`required`, the numeric/duration/timestamp `const`/`lt`/`lte`/`gt`/`gte`/`in`/`not_in` family,
+`required`, the numeric and duration `const`/`lt`/`lte`/`gt`/`gte`/`in`/`not_in` family,
 `finite`, the string length, pattern, affix, list and UUID rules, and recursion into messages,
 lists and map values. Messages are formatted like protovalidate's (`path: message [rule_id]`).
+Timestamp rules aren't evaluated, since no schema uses them yet: `unsupported_rules` reports them.
 
 - Patterns are RE2; `^` and `$` are rewritten to `\A` and `\z`, since Ruby's anchor every line.
 - CEL has no Ruby interpreter. The handful of expressions the schemas use are implemented in
@@ -85,11 +85,14 @@ There is no Connect library for Ruby either. `lib/pug/connect.rb` speaks the
 shapes the SDK uses — unary, and server streaming for `profiles.list` — with binary protobuf, like
 sdk-node. It mirrors connect-es where it matters: `Connect-Timeout-Ms`, the HTTP-status-to-code
 table, JSON error bodies, end-of-stream errors, and the protocol-error codes. Network failures map
-to `unavailable` and timeouts to `deadline_exceeded`, so the batcher retries them.
+to `unavailable` and timeouts to `deadline_exceeded`, so the batcher retries them. `Net::HTTP`
+doesn't follow redirects, as the clients under connect-es and connect-go do, so a 3xx maps to
+`unimplemented`, like a 404, and is never retried; an error response without a Connect body keeps
+its `Location` or the start of its body in the message, since a proxy may have sent it.
 
 Connections are kept alive in a small pool (one per concurrent caller, as `Net::HTTP` isn't
-thread-safe). After a fork the child drops the inherited connections without closing them:
-closing a TLS connection writes to it, and the parent still owns it.
+thread-safe). After a fork the child drops the inherited connections without closing them, even
+in `close`: closing a TLS connection writes to it, and the parent still owns it.
 
 ## Dead code
 
@@ -127,7 +130,7 @@ and a name built at runtime (`public_send(:"has_#{name}?")`) is invisible. Minit
 | `connect.rb`            | Connect protocol client and connection pool.                                      |
 | `validator.rb`          | protovalidate subset.                                                             |
 | `well_known.rb`         | Well-known event catalog from the proto options.                                  |
-| `proto.rb`              | Loads the generated code; reads custom options off descriptors.                   |
+| `proto.rb`              | Loads the generated code; looks up custom options' extensions.                    |
 | `countries.rb`          | ISO 3166-1 alpha-2 set, mirroring the server's `internal/geo`.                    |
 | `errors.rb`, `log.rb`   | `Pug::Error` and its subclasses; the `[Pug SDK]`-prefixed logger wrapper.         |
 
@@ -137,10 +140,10 @@ The contract matches sdk-node. sdk-go's deliberate differences carry over:
 
 - **One sender thread.** Flushes run sequentially instead of overlapping, so event order holds
   across flushes.
-- **Retry backoff.** A send stops at the first transiently failing chunk and re-queues it with the
-  unsent ones, then waits `max_wait` before retrying; size triggers during that wait don't retry
-  early. During `close`, the failed chunk is dead-lettered and the unsent rest reported as
-  undelivered.
+- **Retry backoff.** A send stops at the first transiently failing chunk and re-queues it ahead of
+  the unsent ones, then waits `max_wait` from the failure before retrying; size triggers during
+  that wait don't retry early. During `close`, the failed chunk is dead-lettered and the unsent
+  rest reported as undelivered. Retrying never gives up; the queue's overflow bounds it.
 - **Byte-aware chunks.** Requests are also cut at 4 MiB, and an event that alone exceeds it is
   dropped at `track`: the server refuses bodies over 8 MiB with a transient code, so an oversized
   batch would otherwise retry forever.
@@ -150,6 +153,17 @@ The contract matches sdk-node. sdk-go's deliberate differences carry over:
 
 And some are Ruby's own:
 
+- **A retry waits at least a second.** sdk-go maps a `MaxWait` of 0 to the default; here
+  `max_wait: 0` still sends each event at once, but a retry waits `MIN_RETRY_WAIT`, so a server
+  refusing connections isn't retried in a tight loop.
+- **A close that times out reports the chunk in flight.** sdk-go cancels that send; `Net::HTTP`
+  can't be cancelled from another thread, so it goes on in the background, and `close` reports
+  its events before returning, as possibly delivered. The batcher takes one chunk at a time off
+  the buffer for this, so everything else is still there to report.
+- **Braceless keywords.** Ruby passes `track(id, kind, timestamp: t)` and
+  `track(id, kind, plan: "pro")` alike, as one Hash, so a key named after an option sets that
+  option. Properties passed as an argument of their own, in braces or a variable, are never read
+  for options; likewise `identify`'s traits.
 - **Encodings.** Property strings and keys are transcoded to UTF-8, with invalid bytes replaced by
   U+FFFD, since google-protobuf refuses invalid UTF-8. Ids aren't repaired — a mangled id is a
   different person — so an id that isn't valid UTF-8 drops the call.
@@ -168,7 +182,10 @@ And some are Ruby's own:
   client holds no thread.
 - **Timeouts.** `timeout` bounds each phase of a request (connect, write, read) and is sent as
   `Connect-Timeout-Ms`, so the server enforces the overall deadline; a streaming `list` is bounded
-  as a whole.
+  as a whole, the caller's block included, and takes a `timeout:` of its own.
+- **Nested values.** `JSON.generate` writes an object it doesn't know as its `to_s`, so a `Hash`
+  or `Array` property, or identify's traits, go through `EventBuilder.json_ready` first: times
+  become ISO 8601, other real numbers floats, and anything else is refused.
 - `profiles.delete` returns the `DeleteResponse` (erasure request id and status), as in sdk-go.
 
 ## Testing notes

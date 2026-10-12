@@ -35,7 +35,9 @@ module Pug
       end
     end
 
-    RULES = Proto::Options.number("buf.validate.field")
+    MESSAGE_RULES = Proto.extension("buf.validate.message")
+    ONEOF_RULES = Proto.extension("buf.validate.oneof")
+    FIELD_RULES = Proto.extension("buf.validate.field")
 
     NUMERIC = %i[float double int32 int64 uint32 uint64 sint32 sint64 fixed32 fixed64 sfixed32 sfixed64].freeze
     RANGE = %w[const lt lte gt gte in not_in example].freeze
@@ -44,7 +46,6 @@ module Pug
                  not_contains in not_in uuid tuuid example],
       bool: %w[const example],
       duration: RANGE,
-      timestamp: RANGE,
       **NUMERIC.to_h { |type| [type, %i[float double].include?(type) ? [*RANGE, "finite"] : RANGE] }
     }.freeze
 
@@ -135,6 +136,9 @@ module Pug
 
       value = field.get(message)
       nested = field_plan.nested && plan(field_plan.nested)
+      # A list or map is planned only for required, then, which its presence has satisfied.
+      return if nested.nil? && field_plan.shape != :single
+
       case field_plan.shape
       when :map
         value.each { |key, item| check_message(item, nested, MapEntryPath.new(path, field_plan.name, key), out) }
@@ -185,14 +189,14 @@ module Pug
     end
 
     def build_plan(descriptor)
-      rules = Proto::Options.message(descriptor.options, RULES, Proto::Buf::Validate::MessageRules)
+      rules = MESSAGE_RULES.get(descriptor.options)
       cel = rules&.cel.to_a
       unsupported = cel.reject { |rule| CEL.key?(rule.expression) }.map { |rule| "#{descriptor.name}: cel #{rule.id}" }
       unsupported << "#{descriptor.name}: message oneof rule" if rules&.oneof&.any?
       unsupported << "#{descriptor.name}: cel_expression" if rules&.cel_expression&.any?
       oneofs = []
       descriptor.each_oneof do |oneof|
-        oneofs << oneof.name if Proto::Options.message(oneof.options, RULES, Proto::Buf::Validate::OneofRules)&.required
+        oneofs << oneof.name if ONEOF_RULES.get(oneof.options)&.required
       end
       fields = descriptor.map { |field| build_field_plan(descriptor, field) }
       MessagePlan.new(descriptor.name, fields.freeze, oneofs.freeze, cel.filter_map { |rule| cel_check(rule) }.freeze,
@@ -200,7 +204,7 @@ module Pug
     end
 
     def build_field_plan(descriptor, field)
-      rules = Proto::Options.message(field.options, RULES, Proto::Buf::Validate::FieldRules)
+      rules = FIELD_RULES.get(field.options)
       shape = if field.label != :repeated then :single
               elsif field.type == :message && field.subtype.options.map_entry then :map
               else :list
@@ -213,7 +217,7 @@ module Pug
                 end
       unsupported = unsupported_field_rules(rules, shape).map { |rule| "#{descriptor.name}.#{field.name}: #{rule}" }
       checks = shape == :single && rules ? field_checks(rules) : []
-      convert = method(:seconds) if %i[duration timestamp].include?(rules&.type)
+      convert = method(:seconds) if rules&.type == :duration
       presence = if field.label == :repeated then :repeated
                  elsif field.has_presence? then :explicit
                  else :implicit
@@ -242,22 +246,16 @@ module Pug
     # as google.protobuf.Struct, used for identify traits, have none and are skipped whole.
     def mark_active(built)
       lookup = ->(name) { built[name] || @plans[name] }
+      reaches_rule = ->(field_plan) { field_plan.subtype && lookup.call(field_plan.subtype.name).active }
       built.each_value do |message_plan|
         message_plan.active = message_plan.checks.any? || message_plan.oneofs.any? ||
                               message_plan.fields.any? { |field_plan| field_plan.required || field_plan.checks.any? }
       end
       loop do
-        changed = false
-        built.each_value do |message_plan|
-          next if message_plan.active
-          next unless message_plan.fields.any? do |field_plan|
-            field_plan.subtype && lookup.call(field_plan.subtype.name).active
-          end
+        reached = built.each_value.reject(&:active).select { |message_plan| message_plan.fields.any?(&reaches_rule) }
+        break if reached.empty?
 
-          message_plan.active = true
-          changed = true
-        end
-        break unless changed
+        reached.each { |message_plan| message_plan.active = true }
       end
       # Only fields with a rule, or leading to one, are walked; nested messages without any are
       # dropped from the plan.
@@ -265,7 +263,7 @@ module Pug
         message_plan.checked_fields = message_plan.fields.filter_map do |field_plan|
           next if field_plan.ignore == :IGNORE_ALWAYS
 
-          field_plan.nested = field_plan.subtype if field_plan.subtype && lookup.call(field_plan.subtype.name).active
+          field_plan.nested = field_plan.subtype if reaches_rule.call(field_plan)
           field_plan if field_plan.nested || field_plan.required || field_plan.checks.any?
         end.freeze
       end
@@ -352,15 +350,19 @@ module Pug
     end
 
     def uuid_checks(rules)
-      shape, name, id = case rules.well_known
-                        when :uuid then [UUID, "UUID", "uuid"] if rules.uuid
-                        when :tuuid then [TUUID, "trimmed UUID", "tuuid"] if rules.tuuid
+      shape, name, id = if rules.uuid then [UUID, "UUID", "uuid"]
+                        elsif rules.tuuid then [TUUID, "trimmed UUID", "tuuid"]
                         end
       return [] unless shape
 
       empty = ["string.#{id}_empty", "value is empty, which is not a valid #{name}"].freeze
       invalid = ["string.#{id}", "value must be a valid #{name}"].freeze
-      [->(value) { value.empty? ? empty : (invalid unless shape.match?(value)) }]
+      check = lambda do |value|
+        if value.empty? then empty
+        elsif !shape.match?(value) then invalid
+        end
+      end
+      [check]
     end
 
     def const_checks(type, rules)
@@ -427,7 +429,7 @@ module Pug
     end
 
     def comparable(type, value)
-      %i[duration timestamp].include?(type) ? seconds(value) : value
+      type == :duration ? seconds(value) : value
     end
 
     def seconds(message)
@@ -439,7 +441,6 @@ module Pug
       when :duration
         total = seconds(value)
         "#{total.denominator == 1 ? total.to_i : total.to_f}s"
-      when :timestamp then Time.at(value.seconds, value.nanos, :nsec).utc.iso8601(value.nanos.zero? ? 0 : 9)
       when :float, :double then value.finite? && value == value.truncate ? value.to_i.to_s : value.to_s
       else value.to_s
       end
