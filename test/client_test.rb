@@ -258,10 +258,11 @@ class ClientTest < Minitest::Test
 
   def test_logs_events_the_server_dropped
     pug = client
-    stub_rpc(pug) { BatchCreateResponse.new(accepted: 1, dropped: 2, dropped_by_reason: { "day_out_of_range" => 2 }) }
+    reasons = { "day_out_of_range" => 2 }
+    stub_rpc(pug) { BatchCreateResponse.new(accepted: 1, dropped: 2, dropped_by_reason: reasons) }
     3.times { pug.track("u", "my.custom") }
     pug.flush(timeout: 5)
-    assert_equal ['[Pug SDK] Server dropped 2 of 3 event(s): {"day_out_of_range" => 2}'], logs.warnings
+    assert_equal ["[Pug SDK] Server dropped 2 of 3 event(s): #{reasons}"], logs.warnings
   end
 
   def test_identify_is_raise_free_and_logs_an_invalid_external_id
