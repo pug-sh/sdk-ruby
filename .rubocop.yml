@@ -6,6 +6,10 @@ AllCops:
     - lib/pug/gen/**/*
     - vendor/**/*
 
+# Releases are pushed without rubygems.org MFA.
+Gemspec/RequireMFA:
+  Enabled: false
+
 Layout/LineLength:
   Max: 120
 

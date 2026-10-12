@@ -14,8 +14,7 @@ Gem::Specification.new do |spec|
   spec.metadata = {
     "homepage_uri" => "https://pug.sh",
     "source_code_uri" => "https://github.com/pug-sh/sdk-ruby",
-    "bug_tracker_uri" => "https://github.com/pug-sh/sdk-ruby/issues",
-    "rubygems_mfa_required" => "true"
+    "bug_tracker_uri" => "https://github.com/pug-sh/sdk-ruby/issues"
   }
 
   spec.files = Dir["lib/**/*.rb", "README.md", "LICENSE"]
