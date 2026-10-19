@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    pug-sh (0.0.1)
+    pug-sh (0.0.2)
       google-protobuf (>= 4.30, < 5)
       logger (>= 1.6)
 
@@ -124,7 +124,7 @@ CHECKSUMS
   parser (3.3.12.0) sha256=21a6d7f755d5a24dfbdc6e6b772e4e879a52e7631a88bc5a3a134606052c9828
   path_expander (2.0.1) sha256=2de201164bff4719cc4d0b3767286e9977cc832a59c4d70abab571ec86cb41e4
   prism (1.9.0) sha256=7b530c6a9f92c24300014919c9dcbc055bf4cdf51ec30aed099b06cd6674ef85
-  pug-sh (0.0.1)
+  pug-sh (0.0.2)
   racc (1.8.1) sha256=4a7f6929691dbec8b5209a0b373bc2614882b55fc5d2e447a21aaa691303d62f
   rainbow (3.1.1) sha256=039491aa3a89f42efa1d6dec2fc4e62ede96eb6acd95e52f1ad581182b79bc6a
   rake (13.4.2) sha256=cb825b2bd5f1f8e91ca37bddb4b9aaf345551b4731da62949be002fa89283701
