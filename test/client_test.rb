@@ -313,8 +313,28 @@ class ClientTest < Minitest::Test
     pug = client
     rpc = stub_rpc(pug)
     pug.identify("user_1", { signed_up: { at: Time.at(0).utc }, seats: 2**53 })
-    assert_equal({ "signed_up" => { "at" => "1970-01-01T00:00:00.000Z" }, "seats" => 2.0**53 },
+    assert_equal({ "signedUp" => { "at" => "1970-01-01T00:00:00.000Z" }, "seats" => 2.0**53 },
                  rpc.recorded.first.last.traits.to_h)
+  end
+
+  def test_identify_sends_snake_case_trait_keys_in_camel_case
+    pug = client
+    rpc = stub_rpc(pug)
+    pug.identify("user_1", { "first_name" => "Ada", firstName: "Grace", plan: "pro", "plan" => "team",
+                             address: { postal_code: "10115" } })
+    assert_equal({ "firstName" => "Grace", "plan" => "team", "address" => { "postal_code" => "10115" } },
+                 rpc.recorded.first.last.traits.to_h)
+    assert_equal ['[Pug SDK] identify() traits "first_name" and :firstName both go out as "firstName"; ' \
+                  "sending the last",
+                  '[Pug SDK] identify() traits :plan and "plan" both go out as "plan"; sending the last'],
+                 logs.warnings
+  end
+
+  def test_identify_sends_a_utf16_trait_key
+    pug = client
+    rpc = stub_rpc(pug)
+    pug.identify("user_1", { "plan".encode(Encoding::UTF_16LE) => "pro" })
+    assert_equal({ "plan" => "pro" }, rpc.recorded.first.last.traits.to_h)
   end
 
   def test_identify_sends_the_request

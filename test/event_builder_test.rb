@@ -103,13 +103,13 @@ class EventBuilderTest < Minitest::Test
 
   def test_maps_ruby_values_by_type
     event = build("my.custom",
-                  sym: :pro, float_whole: 10.0, decimal: BigDecimal("1.25"), rational: Rational(1, 4),
+                  sym: :pro, whole: 10.0, decimal: BigDecimal("1.25"), rational: Rational(1, 4),
                   date: Date.new(2026, 10, 10), datetime: DateTime.new(2026, 10, 10, 12),
                   duration: Google::Protobuf::Duration.new(seconds: 90, nanos: 500_000_000),
                   stamp: Google::Protobuf::Timestamp.new(seconds: 5),
                   list: [1, "a", nil], hash: { a: { b: true } })
     assert_equal [:string_value, "pro"], custom(event, "sym")
-    assert_equal [:double_value, 10.0], custom(event, "float_whole")
+    assert_equal [:double_value, 10.0], custom(event, "whole")
     assert_equal [:double_value, 1.25], custom(event, "decimal")
     assert_equal [:double_value, 0.25], custom(event, "rational")
     assert_equal [:string_value, "2026-10-10"], custom(event, "date")
@@ -131,6 +131,33 @@ class EventBuilderTest < Minitest::Test
   def test_keys_may_be_symbols_or_strings
     event = build("my.custom", :a => 1, "b" => 2, 3 => 3)
     assert_equal %w[3 a b], event.custom_properties.keys.sort
+  end
+
+  def test_sends_snake_case_keys_in_camel_case
+    event = build("my.custom", order_total: 5, "line_items" => 2, itemCount: 1, level_1_score: 3,
+                               ORDER_ID: "x", _private: 1, "a.b_c" => 1, a__b: 1, trailing_: 1, order_Total: 1,
+                               "über_preis" => 1, nested: { line_items: 1 })
+    assert_equal %w[ORDER_ID _private a.b_c a__b itemCount level1Score lineItems nested orderTotal order_Total
+                    trailing_ über_preis], event.custom_properties.keys.sort
+    assert_equal [:string_value, '{"line_items":1}'], custom(event, "nested")
+  end
+
+  def test_sends_the_last_of_two_keys_that_go_out_alike
+    event = build("my.custom", order_total: 1, orderTotal: 2, lineItems: 3, line_items: 4, plan: "pro",
+                               "plan" => "team")
+    assert_equal [:int_value, 2], custom(event, "orderTotal")
+    assert_equal [:int_value, 4], custom(event, "lineItems")
+    assert_equal [:string_value, "team"], custom(event, "plan")
+    assert_equal 3, logs.warnings.size
+    assert_equal '[Pug SDK] Properties :plan and "plan" on event "my.custom" both go out as "plan"; sending the last',
+                 logs.warnings.last
+  end
+
+  def test_a_value_that_is_not_sent_leaves_its_twin_alone
+    event = build("my.custom", order_total: nil, orderTotal: 5, line_items: 4, lineItems: Float::NAN)
+    assert_equal [:int_value, 5], custom(event, "orderTotal")
+    assert_equal [:int_value, 4], custom(event, "lineItems")
+    assert_empty logs.warnings.grep(/both go out/)
   end
 
   def test_repairs_and_truncates_strings
@@ -230,6 +257,13 @@ class WellKnownEventTest < Minitest::Test
     assert_equal [:string_value, "news"], custom(event, "referrer")
     assert_nil event.custom_properties["productId"]
     assert_nil event.custom_properties["quantity"]
+  end
+
+  def test_sends_unknown_keys_as_a_custom_event_does
+    event = build("purchase", PURCHASE.merge(coupon_code: "FALL", plan: "pro", "plan" => "team"))
+    assert_equal [:string_value, "FALL"], custom(event, "couponCode")
+    assert_equal [:string_value, "team"], custom(event, "plan")
+    assert_equal 1, logs.warnings.grep(/both go out as "plan"/).size
   end
 
   def test_a_nil_field_is_unset
