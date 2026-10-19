@@ -239,10 +239,25 @@ module Pug
     # Struct can't carry, such as NaN. A Struct's numbers are doubles, so an integer past 2^53
     # would arrive changed.
     def to_struct(traits)
-      ready = EventBuilder.json_ready(traits, max_integer: EventBuilder::MAX_SAFE_FLOAT)
+      ready = EventBuilder.json_ready(camel_case_keys(traits), max_integer: EventBuilder::MAX_SAFE_FLOAT)
       ::Google::Protobuf::Struct.from_hash(JSON.parse(JSON.generate(ready)))
     rescue StandardError => e
       raise NotSerializable, e.message
+    end
+
+    # Only the top level, as for properties: a nested Hash is as likely data keyed by ids.
+    def camel_case_keys(traits)
+      given = {}
+      traits.each_with_object({}) do |(key, value), out|
+        name = key.to_s
+        name = EventBuilder.camel_case(name.encoding.ascii_compatible? ? name : name.encode(Encoding::UTF_8))
+        if given.key?(name)
+          @log.warn("identify() traits #{given[name].inspect} and #{key.inspect} both go out as #{name.inspect}; " \
+                    "sending the last")
+        end
+        given[name] = key
+        out[name] = value
+      end
     end
   end
 end

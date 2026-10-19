@@ -40,6 +40,14 @@ class WellKnownCatalogTest < Minitest::Test
     end
     assert_operator seen.size, :>, Pug::WellKnown::CATALOG.size
   end
+
+  # The well-known lookup relies on it, and on an event the catalog leaves out a custom key lands where the field would.
+  def test_camel_cases_keys_as_protobuf_names_fields_in_json
+    namespace = Pug::Proto::Common::Events::V1
+    namespace.constants.map { |name| namespace.const_get(name) }.grep(Class).each do |klass|
+      klass.descriptor.each { |field| assert_equal field.json_name, Pug::EventBuilder.camel_case(field.name) }
+    end
+  end
 end
 
 class ValidatorTest < Minitest::Test

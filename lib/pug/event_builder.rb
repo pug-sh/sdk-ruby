@@ -30,6 +30,8 @@ module Pug
     # Past 2^53 a Float may already have been rounded, so it can't stand for an exact integer.
     MAX_SAFE_FLOAT = 2**53
 
+    SNAKE_CASE = /\A[a-z][a-z0-9]*(?:_[a-z0-9]+)+\z/
+
     INTEGER_RANGES = {
       int32: (-(2**31))..((2**31) - 1),
       sint32: (-(2**31))..((2**31) - 1),
@@ -66,15 +68,15 @@ module Pug
     Timestamp = ::Google::Protobuf::Timestamp
 
     SchemaField = Struct.new(:descriptor, :name, :json_name, :type)
-    Schema = Struct.new(:klass, :name, :by_key, :fields)
+    Schema = Struct.new(:klass, :name, :by_json_name, :fields)
 
-    # Field lookups for every well-known schema, by proto name and JSON name, worked out once.
+    # Field lookups for every well-known schema, by JSON name, worked out once.
     SCHEMAS = WellKnown::CATALOG.transform_values do |klass|
       fields = klass.descriptor.map do |field|
         SchemaField.new(field, field.name, field.json_name, field.type).freeze
       end
-      by_key = fields.flat_map { |field| [[field.name, field], [field.json_name, field]] }.to_h
-      Schema.new(klass, klass.descriptor.name, by_key.freeze, fields.freeze).freeze
+      by_json_name = fields.to_h { |field| [field.json_name, field] }
+      Schema.new(klass, klass.descriptor.name, by_json_name.freeze, fields.freeze).freeze
     end.freeze
 
     class FieldError < StandardError
@@ -125,6 +127,13 @@ module Pug
 
         Float(value)
       end
+    end
+
+    # Protobuf's JSON-name rule, so order_total lands on a well-known field's JSON name. Only
+    # lowercase snake_case is renamed, since the full rule would turn ORDER_ID into ORDERID; the
+    # ascii_only? check keeps match? from raising on a UTF-16 or broken key.
+    def self.camel_case(key)
+      key.ascii_only? && key.match?(SNAKE_CASE) ? key.gsub(/_[a-z0-9]/) { |pair| pair[1].upcase } : key
     end
 
     def initialize(log)
@@ -213,8 +222,8 @@ module Pug
     end
 
     # Typed fields render by their proto type rather than their Ruby value, so a whole-number
-    # double stays a double. Keys may be the field's proto name or its JSON name; unknown keys
-    # ride along as custom properties.
+    # double stays a double. A key names a field once camel-cased, so the proto name works as well
+    # as the JSON name; unknown keys ride along as custom properties.
     def well_known_properties(schema, kind, properties)
       message, extras = typed_message(schema, properties)
       violations = Validator.validate(message)
@@ -234,9 +243,9 @@ module Pug
       extras = {}
       properties.each do |key, value|
         name = utf8(key.to_s)
-        field = schema.by_key[name]
+        field = schema.by_json_name[self.class.camel_case(name)]
         if field.nil?
-          extras[name] = value
+          extras[key] = value
         elsif given.key?(field)
           raise FieldError.new(field.name, "given twice, as #{given[field].first} and #{name}")
         else
@@ -373,9 +382,18 @@ module Pug
     end
 
     def custom_properties(properties, kind)
+      given = {}
       properties.each_with_object({}) do |(key, value), out|
+        name = self.class.camel_case(utf8(key.to_s))
         mapped = custom_value(value)
-        out[utf8(key.to_s)] = mapped if mapped
+        next unless mapped
+
+        if given.key?(name)
+          @log.warn("Properties #{given[name].inspect} and #{key.inspect} on event \"#{kind}\" both go out as " \
+                    "#{name.inspect}; sending the last")
+        end
+        given[name] = key
+        out[name] = mapped
       rescue NotRepresentable => e
         @log.warn("Property \"#{key}\" on event \"#{kind}\" not representable (#{e.message}), skipping")
       end

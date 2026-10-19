@@ -4,19 +4,19 @@ Internal guide for working on `sdk-ruby`. End-user docs live in the [README](../
 
 ## Toolchain
 
-- **Ruby** 3.3 or newer, with **Bundler** — `bundle install` sets up everything below except buf
+- **Ruby** 3.3 or newer, with **Bundler**: `bundle install` sets up everything below except buf
   and protoc.
-- **[Minitest](https://github.com/minitest/minitest)** + **Rake** — tests (`bundle exec rake test`).
-- **[RuboCop](https://rubocop.org)** — lint and format (see `.rubocop.yml`).
-- **[debride](https://github.com/seattlerb/debride)** — dead code (see [Dead code](#dead-code)).
-- **[buf](https://buf.build/docs/installation)** 1.73 and **protoc** 36.1 — re-vendor and
+- **[Minitest](https://github.com/minitest/minitest)** + **Rake**: tests (`bundle exec rake test`).
+- **[RuboCop](https://rubocop.org)**: lint and format (see `.rubocop.yml`).
+- **[debride](https://github.com/seattlerb/debride)**: dead code (see [Dead code](#dead-code)).
+- **[buf](https://buf.build/docs/installation)** 1.73 and **protoc** 36.1: re-vendor and
   regenerate the protobuf code. Only needed when updating protos.
 
 ## Protobuf types (vendored)
 
 Protobuf types are **vendored**, not pulled from the Buf Schema Registry: the generated code is
 committed under `lib/pug/gen/` and shipped in the gem, so `gem install` needs nothing but
-rubygems.org. The `.proto` sources are mirrored under `proto/` from a **pinned** BSR commit — the
+rubygems.org. The `.proto` sources are mirrored under `proto/` from a **pinned** BSR commit, the
 same commit and allowlist as sdk-node and sdk-go. See the `Makefile`:
 
 | Command             | What it does                                                                                                                             |
@@ -27,7 +27,7 @@ same commit and allowlist as sdk-node and sdk-go. See the `Makefile`:
 
 To take a newer schema: run `make proto-latest`, set `PROTO_COMMIT` in the `Makefile`, then
 `make sync-protos && make protos`, run the tests, and review + commit the `proto/` and
-`lib/pug/gen/` diff. Builds and CI never touch the BSR — they load the committed snapshot, and CI
+`lib/pug/gen/` diff. Builds and CI never touch the BSR: they load the committed snapshot, and CI
 fails if a fresh `make protos` differs from it.
 
 Things specific to Ruby codegen:
@@ -82,7 +82,7 @@ Timestamp rules aren't evaluated, since no schema uses them yet: `unsupported_ru
 
 There is no Connect library for Ruby either. `lib/pug/connect.rb` speaks the
 [Connect protocol](https://connectrpc.com/docs/protocol) over `Net::HTTP` for the two call
-shapes the SDK uses — unary, and server streaming for `profiles.list` — with binary protobuf, like
+shapes the SDK uses (unary, and server streaming for `profiles.list`) with binary protobuf, like
 sdk-node. It mirrors connect-es where it matters: `Connect-Timeout-Ms`, the HTTP-status-to-code
 table, JSON error bodies, end-of-stream errors, and the protocol-error codes. Network failures map
 to `unavailable` and timeouts to `deadline_exceeded`, so the batcher retries them. `Net::HTTP`
@@ -113,7 +113,7 @@ and a name built at runtime (`public_send(:"has_#{name}?")`) is invisible. Minit
 | `make deadcode`            | Fail on methods nothing calls ([Dead code](#dead-code))          |
 | `make build`               | `gem build pug-sh.gemspec`                                       |
 | `make check`               | `lint`, `deadcode`, `test`, `build`                              |
-| `make ci`                  | `protos`, `check-codegen`, then `check` — what CI runs           |
+| `make ci`                  | `protos`, `check-codegen`, then `check` (what CI runs)           |
 
 `Pug::VERSION` in `lib/pug/version.rb` is the gem's version and is sent with every event as
 `$sdkVersion`. Bump it together with the release tag (`vX.Y.Z`).
@@ -122,7 +122,7 @@ and a name built at runtime (`public_send(:"has_#{name}?")`) is invisible. Minit
 
 | File                    | Responsibility                                                                    |
 | ----------------------- | --------------------------------------------------------------------------------- |
-| `client.rb`             | `Pug::Client` — options, ingestion (`track`/`identify`), lifecycle.               |
+| `client.rb`             | `Pug::Client`: options, ingestion (`track`/`identify`), lifecycle.                |
 | `event_builder.rb`      | Builds and validates `Event` protos; maps Ruby values and typed schemas to `PropertyValue`; location. |
 | `batcher.rb`            | Batching transport: one sender thread, flush triggers, retry, dead-letter.        |
 | `reads.rb`              | `Profiles`/`Activity`/`Insights` read facades and error normalization.            |
@@ -165,17 +165,20 @@ And some are Ruby's own:
   option. Properties passed as an argument of their own, in braces or a variable, are never read
   for options; likewise `identify`'s traits.
 - **Encodings.** Property strings and keys are transcoded to UTF-8, with invalid bytes replaced by
-  U+FFFD, since google-protobuf refuses invalid UTF-8. Ids aren't repaired — a mangled id is a
-  different person — so an id that isn't valid UTF-8 drops the call.
+  U+FFFD, since google-protobuf refuses invalid UTF-8. Ids aren't repaired (a mangled id is a
+  different person), so an id that isn't valid UTF-8 drops the call.
 - **Duration fields take seconds.** A number for a Duration field is seconds, Ruby's unit for time
   spans and what google-protobuf itself accepts; sdk-node refuses a bare number because
   JavaScript's convention is milliseconds. `{ seconds:, nanos: }` and `Google::Protobuf::Duration`
   work too.
-- **Field names.** Well-known properties may be keyed by the proto field name (`product_id`) or
-  the JSON name (`productId`), and go out under the JSON name; location keys likewise
-  (`postal_code`/`postalCode`).
+- **Keys.** A snake_case property or trait key goes out in camelCase (`order_total` →
+  `orderTotal`), by protobuf's JSON-name rule, so Ruby's spelling and JavaScript's usual one land
+  on one key; sdk-node, sdk-go and sdk-python send keys as given. Only the top level is renamed,
+  since a nested Hash is as likely data keyed by ids, and of two keys that come out alike the last
+  wins, as in `Hash#merge`. Well-known properties may be keyed by either name
+  (`product_id`/`productId`), and location keys likewise (`postal_code`/`postalCode`).
 - **Blocking calls.** `identify` returns once the server answers, and `flush`/`close` wait, with an
-  optional `timeout:` and a boolean result — the Ruby counterparts of awaiting sdk-node's promises.
+  optional `timeout:` and a boolean result, the Ruby counterparts of awaiting sdk-node's promises.
   `track`'s `timestamp` option is a `Time`, not epoch milliseconds.
 - **Forks.** A client created before a fork starts empty in the child, with its own sender thread
   and connections; the sender thread exits when idle and restarts on the next event, so an unused
