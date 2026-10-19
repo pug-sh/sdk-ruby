@@ -249,7 +249,8 @@ module Pug
     def camel_case_keys(traits)
       given = {}
       traits.each_with_object({}) do |(key, value), out|
-        name = EventBuilder.camel_case(key.to_s)
+        name = key.to_s
+        name = EventBuilder.camel_case(name.encoding.ascii_compatible? ? name : name.encode(Encoding::UTF_8))
         if given.key?(name)
           @log.warn("identify() traits #{given[name].inspect} and #{key.inspect} both go out as #{name.inspect}; " \
                     "sending the last")

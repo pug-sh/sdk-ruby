@@ -330,11 +330,11 @@ class ClientTest < Minitest::Test
                  logs.warnings
   end
 
-  def test_identify_sends_a_utf16_trait_key
+  def test_identify_sends_a_utf16_trait_key_in_camel_case
     pug = client
     rpc = stub_rpc(pug)
-    pug.identify("user_1", { "plan".encode(Encoding::UTF_16LE) => "pro" })
-    assert_equal({ "plan" => "pro" }, rpc.recorded.first.last.traits.to_h)
+    pug.identify("user_1", { "first_name".encode(Encoding::UTF_16LE) => "Ada" })
+    assert_equal({ "firstName" => "Ada" }, rpc.recorded.first.last.traits.to_h)
   end
 
   def test_identify_sends_the_request
