@@ -9,4 +9,4 @@ gem "debride", "~> 1.15", require: false
 gem "erb", require: false
 gem "minitest", "~> 6.0"
 gem "rake", "~> 13.4"
-gem "rubocop", "~> 1.91", require: false
+gem "rubocop", "~> 1.92", require: false
