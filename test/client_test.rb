@@ -7,6 +7,7 @@ class ClientTest < Minitest::Test
   include Pug::TestSupport
 
   BatchCreateResponse = Pug::Proto::Sdk::Events::V1::BatchCreateResponse
+  UNIMPLEMENTED = Pug::Error.new("HTTP 404", code: :unimplemented)
 
   def teardown
     @client&.close(timeout: 5)
@@ -24,6 +25,17 @@ class ClientTest < Minitest::Test
   def sent_events(client, rpc)
     client.flush(timeout: 5)
     rpc.recorded.flat_map { |name, request| name == :batch_create ? request.events.to_a : [] }
+  end
+
+  def sent_identifies(client, rpc)
+    client.flush(timeout: 5)
+    rpc.recorded.flat_map do |name, request|
+      case name
+      when :batch_identify then request.identifies.to_a
+      when :identify then [request]
+      else []
+      end
+    end
   end
 
   def test_requires_an_api_key
@@ -54,7 +66,7 @@ class ClientTest < Minitest::Test
     end
   end
 
-  def test_on_error_must_take_the_error_and_the_events
+  def test_on_error_must_take_the_error_and_what_was_lost
     [->(_) {}, ->(_, _, _) {}, Class.new { def call(_) = nil }.new].each do |on_error|
       error = assert_raises(ArgumentError) { Pug::Client.new(api_key: "prv_test", on_error: on_error) }
       assert_match(/on_error must take two arguments/, error.message)
@@ -183,7 +195,7 @@ class ClientTest < Minitest::Test
     rpc = stub_rpc(pug)
     pug.identify("user_1", anonymous_id: "anon-1")
     pug.identify("user_1", plan: "pro", device_id: "d1")
-    first, second = rpc.recorded.map(&:last)
+    first, second = sent_identifies(pug, rpc)
     assert_equal ["anon-1", false], [first.anonymous_id, first.has_traits?]
     assert_equal ["d1", { "plan" => "pro" }], [second.device_id, second.traits.to_h]
   end
@@ -202,7 +214,7 @@ class ClientTest < Minitest::Test
 
   def test_close_releases_connections_even_when_draining_raises
     pug = client
-    pug.instance_variable_get(:@batcher).define_singleton_method(:close) { |**| raise "boom" }
+    pug.instance_variable_get(:@event_queue).define_singleton_method(:finish_close) { |*| raise "boom" }
     released = false
     pug.instance_variable_get(:@connect).define_singleton_method(:close) { released = true }
     assert_raises(RuntimeError) { pug.close }
@@ -210,17 +222,15 @@ class ClientTest < Minitest::Test
     @client = nil
   end
 
-  def test_track_session_id_option
+  def test_track_keeps_the_clients_session_for_an_empty_or_invalid_session_id
     pug = client
     rpc = stub_rpc(pug) { BatchCreateResponse.new }
-    pug.track("u", "my.custom", nil, session_id: "")
-    pug.track("u", "my.custom", nil, session_id: 7)
-    pug.track("u", "my.custom", nil, session_id: "nope")
-    events = sent_events(pug, rpc)
-    assert_equal 1, events.size
-    assert_equal pug.instance_variable_get(:@session_id), events.first.session_id
-    assert_match(/session_id must be a String/, logs.errors[0])
-    assert_match(/session_id: value must be a valid UUID/, logs.errors[1])
+    ["", 7, "nope", "{#{UUID}}", UUID.delete("-"), UUID.encode(Encoding::UTF_16LE)].each do |session_id|
+      pug.track("u", "my.custom", nil, session_id: session_id)
+    end
+    assert_equal [pug.instance_variable_get(:@session_id)] * 6, sent_events(pug, rpc).map(&:session_id)
+    assert_equal 5, logs.warnings.grep(/Ignoring invalid track session_id .+; expected a UUID String/).size
+    assert_empty logs.errors
   end
 
   def test_track_ignores_unknown_options
@@ -247,13 +257,25 @@ class ClientTest < Minitest::Test
 
   def test_on_error_receives_undeliverable_events
     failures = Queue.new
-    pug = client(on_error: ->(error, events) { failures << [error, events] })
+    pug = client(on_error: ->(error, lost) { failures << [error, lost] })
     stub_rpc(pug) { raise Pug::Error.new("denied", code: :permission_denied) }
     pug.track("u", "my.custom")
     pug.flush(timeout: 5)
-    error, events = failures.pop(timeout: 5)
+    error, lost = failures.pop(timeout: 5)
     assert_equal :permission_denied, error.code
-    assert_equal ["my.custom"], events.map(&:kind)
+    assert_equal [["my.custom"], []], [lost.events.map(&:kind), lost.identifies]
+  end
+
+  def test_on_error_receives_undeliverable_identifies
+    failures = Queue.new
+    pug = client(on_error: ->(error, lost) { failures << [error, lost] })
+    stub_rpc(pug) { raise Pug::Error.new("denied", code: :permission_denied) }
+    pug.identify("user_1")
+    pug.flush(timeout: 5)
+    error, lost = failures.pop(timeout: 5)
+    assert_equal :permission_denied, error.code
+    assert_equal [[], ["user_1"]], [lost.events, lost.identifies.map(&:external_id)]
+    assert_match(/Permanent error, 1 identify dropped/, logs.errors.last)
   end
 
   def test_logs_events_the_server_dropped
@@ -275,6 +297,7 @@ class ClientTest < Minitest::Test
     rpc = stub_rpc(pug)
     assert_nil pug.identify("user_1", nil, anonymous_id: "nope")
     assert_match(/Invalid identify request: anonymous_id: value does not match regex pattern/, logs.errors.last)
+    pug.flush(timeout: 5)
     assert_empty rpc.recorded
   end
 
@@ -282,6 +305,7 @@ class ClientTest < Minitest::Test
     pug = client
     rpc = stub_rpc(pug)
     [5, "anon-\xFF".b].each { |anonymous_id| assert_nil pug.identify("user_1", nil, anonymous_id: anonymous_id) }
+    pug.flush(timeout: 5)
     assert_empty rpc.recorded
     assert_equal 2, logs.errors.grep(/anonymous_id/).size
   end
@@ -303,10 +327,22 @@ class ClientTest < Minitest::Test
   def test_identify_drops_traits_that_are_not_json_serializable
     pug = client
     rpc = stub_rpc(pug)
-    [{ score: Float::NAN }, { tags: Set["a"] }, { id: (2**53) + 1 }].each { |traits| pug.identify("user_1", traits) }
+    [{ tags: Set["a"] }, { id: (2**53) + 1 }].each { |traits| pug.identify("user_1", traits) }
+    pug.flush(timeout: 5)
     assert_empty rpc.recorded
-    assert_equal 3, logs.errors.grep(/traits must be JSON-serializable/).size
+    assert_equal 2, logs.errors.grep(/traits must be JSON-serializable/).size
     assert_match(/9007199254740993 is out of range/, logs.errors.last)
+  end
+
+  def test_identify_skips_a_trait_holding_nan_or_infinity
+    pug = client
+    rpc = stub_rpc(pug)
+    pug.identify("user_1", { score: Float::NAN, best: { lap: Float::INFINITY }, laps: [1.5, -Float::INFINITY],
+                             ratio: Rational(1, 3), plan: "pro" })
+    traits = sent_identifies(pug, rpc).map { |request| request.traits.to_h }
+    assert_equal [{ "ratio" => 1.0 / 3, "plan" => "pro" }], traits
+    skipped = logs.warnings.map { |warning| warning[/trait (\S+) is not representable \(NaN or Infinity\)/, 1] }
+    assert_equal ['"score"', '"best"', '"laps"'], skipped
   end
 
   def test_identify_sends_nested_times_as_iso8601
@@ -314,7 +350,7 @@ class ClientTest < Minitest::Test
     rpc = stub_rpc(pug)
     pug.identify("user_1", { signed_up: { at: Time.at(0).utc }, seats: 2**53 })
     assert_equal({ "signedUp" => { "at" => "1970-01-01T00:00:00.000Z" }, "seats" => 2.0**53 },
-                 rpc.recorded.first.last.traits.to_h)
+                 sent_identifies(pug, rpc).first.traits.to_h)
   end
 
   def test_identify_sends_snake_case_trait_keys_in_camel_case
@@ -323,7 +359,7 @@ class ClientTest < Minitest::Test
     pug.identify("user_1", { "first_name" => "Ada", firstName: "Grace", plan: "pro", "plan" => "team",
                              address: { postal_code: "10115" } })
     assert_equal({ "firstName" => "Grace", "plan" => "team", "address" => { "postal_code" => "10115" } },
-                 rpc.recorded.first.last.traits.to_h)
+                 sent_identifies(pug, rpc).first.traits.to_h)
     assert_equal ['[Pug SDK] identify() traits "first_name" and :firstName both go out as "firstName"; ' \
                   "sending the last",
                   '[Pug SDK] identify() traits :plan and "plan" both go out as "plan"; sending the last'],
@@ -334,7 +370,7 @@ class ClientTest < Minitest::Test
     pug = client
     rpc = stub_rpc(pug)
     pug.identify("user_1", { "first_name".encode(Encoding::UTF_16LE) => "Ada" })
-    assert_equal({ "firstName" => "Ada" }, rpc.recorded.first.last.traits.to_h)
+    assert_equal({ "firstName" => "Ada" }, sent_identifies(pug, rpc).first.traits.to_h)
   end
 
   def test_identify_sends_the_request
@@ -342,8 +378,11 @@ class ClientTest < Minitest::Test
     rpc = stub_rpc(pug)
     pug.identify(7, { plan: "pro", seats: 3, tags: [:a], nested: { ok: true } },
                  anonymous_id: "anon-1", device_id: "d1")
-    name, request = rpc.recorded.first
-    assert_equal :identify, name
+    pug.flush(timeout: 5)
+    name, batch = rpc.recorded.first
+    assert_equal :batch_identify, name
+    assert_equal 1, batch.identifies.size
+    request = batch.identifies.first
     assert_equal "7", request.external_id
     assert_equal "anon-1", request.anonymous_id
     assert_equal "d1", request.device_id
@@ -355,17 +394,192 @@ class ClientTest < Minitest::Test
     pug = client
     rpc = stub_rpc(pug)
     pug.identify("user_1", nil, anonymous_id: "", device_id: nil)
-    _, request = rpc.recorded.first
+    request = sent_identifies(pug, rpc).first
     refute request.has_traits?
     refute request.has_anonymous_id?
     refute request.has_device_id?
   end
 
-  def test_identify_logs_failures
+  def test_identify_queues_until_flush
     pug = client
-    stub_rpc(pug) { raise Pug::Error.new("down", code: :unavailable) }
+    rpc = stub_rpc(pug)
+    pug.identify("user_1", plan: "pro")
+    pug.identify("user_2")
+    assert_empty rpc.recorded
+    pug.flush(timeout: 5)
+    batches = rpc.recorded
+    assert_equal [:batch_identify], batches.map(&:first)
+    assert_equal %w[user_1 user_2], batches.first.last.identifies.map(&:external_id)
+  end
+
+  def test_identify_retries_a_transient_failure
+    pug = client
+    calls = 0
+    rpc = stub_rpc(pug) do
+      calls += 1
+      raise Pug::Error.new("down", code: :unavailable) if calls == 1
+    end
+    pug.identify("user_1")
+    pug.flush(timeout: 5)
+    assert_equal ["[Pug SDK] Transient error sending 1 identify, will retry: Pug::Error: unavailable: down"],
+                 logs.warnings
+    pug.flush(timeout: 5)
+    assert_equal([%w[user_1], %w[user_1]], rpc.recorded.map { |_, batch| batch.identifies.map(&:external_id) })
+    assert_empty logs.errors
+  end
+
+  def test_identify_falls_back_to_one_call_each_without_batch_identify
+    pug = client
+    rpc = stub_rpc(pug) { |name, _| raise UNIMPLEMENTED if name == :batch_identify }
+    pug.identify("user_1")
+    pug.identify("user_2")
+    pug.flush(timeout: 5)
+    pug.identify("user_3")
+    pug.flush(timeout: 5)
+    calls = rpc.recorded
+    assert_equal %i[batch_identify identify identify identify], calls.map(&:first)
+    assert_equal(%w[user_1 user_2 user_3], calls.drop(1).map { |_, request| request.external_id })
+    assert_equal ["[Pug SDK] Server has no BatchIdentify; sending identifies one at a time."], logs.warnings
+  end
+
+  def test_identify_fallback_retries_only_what_it_did_not_deliver
+    pug = client
+    failed = false
+    rpc = stub_rpc(pug) do |name, request|
+      raise UNIMPLEMENTED if name == :batch_identify
+      next if failed || request.external_id != "user_2"
+
+      failed = true
+      raise Pug::Error.new("down", code: :unavailable)
+    end
+    %w[user_1 user_2 user_3].each { |id| pug.identify(id) }
+    pug.flush(timeout: 5)
+    assert_match(/Transient error sending 2 identifies, will retry/, logs.warnings.last)
+    pug.flush(timeout: 5)
+    sent = rpc.recorded.filter_map { |name, request| request.external_id if name == :identify }
+    assert_equal %w[user_1 user_2 user_2 user_3], sent
+  end
+
+  def test_identify_fallback_dead_letters_only_what_it_did_not_deliver
+    failures = Queue.new
+    pug = client(on_error: ->(error, lost) { failures << [error, lost] })
+    stub_rpc(pug) do |name, request|
+      raise UNIMPLEMENTED if name == :batch_identify
+      raise Pug::Error.new("bad", code: :invalid_argument) if request.external_id == "user_2"
+    end
+    %w[user_1 user_2 user_3].each { |id| pug.identify(id) }
+    pug.flush(timeout: 5)
+    error, lost = failures.pop(timeout: 5)
+    assert_equal :invalid_argument, error.code
+    assert_equal %w[user_2 user_3], lost.identifies.map(&:external_id)
+  end
+
+  def test_identify_drops_one_too_large_to_send
+    pug = client
+    rpc = stub_rpc(pug)
+    pug.identify("user_big", blob: "x" * (2 * 1024 * 1024))
+    pug.identify("user_small")
+    assert_equal %w[user_small], sent_identifies(pug, rpc).map(&:external_id)
+    assert_match(/Identify "user_big" dropped: \d+ bytes is too large to send \(limit 921600\)/, logs.errors.last)
+  end
+
+  def test_identify_contains_unexpected_errors
+    pug = client
+    pug.instance_variable_get(:@identify_queue).define_singleton_method(:enqueue) { |*| raise "kaboom" }
     assert_nil pug.identify("user_1")
-    assert_equal '[Pug SDK] Failed to identify "user_1": Pug::Error: unavailable: down', logs.errors.last
+    assert_match(/Unexpected error in identify\("user_1"\): RuntimeError: kaboom/, logs.errors.last)
+  end
+
+  def test_close_drains_events_and_identifies
+    pug = client
+    rpc = stub_rpc(pug) { |name, _| BatchCreateResponse.new if name == :batch_create }
+    pug.track("user_1", "my.custom")
+    pug.identify("user_1")
+    assert pug.close(timeout: 5)
+    assert_equal %i[batch_create batch_identify], rpc.recorded.map(&:first).sort
+  end
+
+  def test_warns_about_bad_batch_settings_once_for_both_queues
+    client(batch: { max_size: 5000, max_wait: -1, extra: 1 })
+    assert_equal 3, logs.warnings.size, logs.warnings.inspect
+  end
+
+  def test_flush_and_close_from_on_error_do_not_wait_on_the_other_queue
+    gate = Queue.new
+    results = Queue.new
+    pug = client(on_error: ->(_, _) { results << [pug.flush, pug.close] })
+    stub_rpc(pug) do |name, _|
+      next gate.pop && BatchCreateResponse.new if name == :batch_create
+
+      raise Pug::Error.new("bad", code: :invalid_argument)
+    end
+    pug.track("u", "my.custom")
+    pug.identify("user_1")
+    pug.flush(timeout: 0)
+    assert_equal [false, false], results.pop(timeout: 5)
+    gate << :go
+  end
+
+  def test_flush_from_on_error_on_the_closing_thread_does_not_wait
+    gate = Queue.new
+    flushed = Queue.new
+    pug = client(on_error: ->(_, _) { flushed << pug.flush })
+    stub_rpc(pug) { gate.pop }
+    pug.track("u", "my.custom")
+    pug.identify("user_1")
+    closer = Thread.new { pug.close(timeout: 0.2) }
+    assert closer.join(5), "close overran its timeout"
+    refute closer.value
+    assert_equal [false, true], Array.new(flushed.size) { flushed.pop }
+  ensure
+    2.times { gate << :go }
+  end
+
+  def test_concurrent_closes_leave_both_queues_to_the_first
+    failures = Queue.new
+    pug = client(on_error: ->(error, lost) { failures << [error, lost] })
+    gate = Queue.new
+    rpc = stub_rpc(pug) { |name, _| name == :batch_create ? BatchCreateResponse.new : gate.pop }
+    pug.track("u", "my.custom")
+    pug.identify("user_1")
+    identify_queue = pug.instance_variable_get(:@identify_queue)
+    start_close = identify_queue.method(:start_close)
+    paused = Queue.new
+    resume = Queue.new
+    identify_queue.define_singleton_method(:start_close) do
+      if Thread.current.name == "first"
+        paused << true
+        resume.pop
+      end
+      start_close.call
+    end
+    first = Thread.new do
+      Thread.current.name = "first"
+      pug.close(timeout: 5)
+    end
+    paused.pop
+    second = Thread.new { pug.close(timeout: 0.05) }
+    wait_until { second.status == "sleep" }
+    resume << true
+    refute second.value
+    gate << :go
+    assert first.value
+    assert_empty Array.new(failures.size) { failures.pop }
+    assert_equal %i[batch_create batch_identify], rpc.recorded.map(&:first).sort
+  end
+
+  def test_close_from_on_error_during_a_close_leaves_the_drain_to_it
+    calls = Queue.new
+    pug = client(on_error: ->(_, _) { calls << pug.close })
+    rpc = stub_rpc(pug) do |name, _|
+      raise Pug::Error.new("down", code: :unavailable) if name == :batch_create
+    end
+    pug.track("u", "my.custom")
+    pug.identify("user_1")
+    closer = Thread.new { pug.close }
+    assert closer.join(5), "close deadlocked"
+    assert_equal [false], Array.new(calls.size) { calls.pop }
+    assert_equal %i[batch_create batch_identify], rpc.recorded.map(&:first).sort
   end
 
   def test_identify_warns_and_drops_after_close

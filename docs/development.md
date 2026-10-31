@@ -16,8 +16,8 @@ Internal guide for working on `sdk-ruby`. End-user docs live in the [README](../
 
 Protobuf types are **vendored**, not pulled from the Buf Schema Registry: the generated code is
 committed under `lib/pug/gen/` and shipped in the gem, so `gem install` needs nothing but
-rubygems.org. The `.proto` sources are mirrored under `proto/` from a **pinned** BSR commit, the
-same commit and allowlist as sdk-node and sdk-go. See the `Makefile`:
+rubygems.org. The `.proto` sources are mirrored under `proto/` from a **pinned** BSR commit, with
+the same allowlist as sdk-node and sdk-go and normally the same commit. See the `Makefile`:
 
 | Command             | What it does                                                                                                                             |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
@@ -122,9 +122,9 @@ and a name built at runtime (`public_send(:"has_#{name}?")`) is invisible. Minit
 
 | File                    | Responsibility                                                                    |
 | ----------------------- | --------------------------------------------------------------------------------- |
-| `client.rb`             | `Pug::Client`: options, ingestion (`track`/`identify`), lifecycle.                |
+| `client.rb`             | `Pug::Client`: options, ingestion (`track`/`identify`), lifecycle; the `BatchCreate` sink and the identify sink, which falls back to one `Identify` per item when `BatchIdentify` answers `unimplemented`. `Pug::Undelivered`. |
 | `event_builder.rb`      | Builds and validates `Event` protos; maps Ruby values and typed schemas to `PropertyValue`; location. |
-| `batcher.rb`            | Batching transport: one sender thread, flush triggers, retry, dead-letter.        |
+| `batcher.rb`            | Batching transport, one per queue (events, identifies): one sender thread, flush triggers, retry, dead-letter. |
 | `reads.rb`              | `Profiles`/`Activity`/`Insights` read facades and error normalization.            |
 | `rpc.rb`                | The procedure table (path, request and response class per RPC).                   |
 | `connect.rb`            | Connect protocol client and connection pool.                                      |
@@ -138,18 +138,31 @@ and a name built at runtime (`public_send(:"has_#{name}?")`) is invisible. Minit
 
 The contract matches sdk-node. sdk-go's deliberate differences carry over:
 
-- **One sender thread.** Flushes run sequentially instead of overlapping, so event order holds
-  across flushes.
+- **One sender thread per queue.** Flushes run sequentially instead of overlapping, so event order
+  holds across flushes. Identifies have their own queue and sender, so a burst of them can't hold
+  up event batches.
 - **Retry backoff.** A send stops at the first transiently failing chunk and re-queues it ahead of
   the unsent ones, then waits `max_wait` from the failure before retrying; size triggers during
   that wait don't retry early. During `close`, the failed chunk is dead-lettered and the unsent
   rest reported as undelivered. Retrying never gives up; the queue's overflow bounds it.
 - **Byte-aware chunks.** Requests are also cut at 4 MiB, and an event that alone exceeds it is
   dropped at `track`: the server refuses bodies over 8 MiB with a transient code, so an oversized
-  batch would otherwise retry forever.
+  batch would otherwise retry forever. An identify over 900 KiB is dropped at `identify`: one
+  identify can't be split across NATS messages, and NATS refuses a message over its default 1 MiB
+  however small the request.
 - **`max_queue_size` holds after a retry**, too: re-queued events that overflow it drop the oldest.
 - **Types over heuristics.** A `Float` is always a double and an `Integer` always an int; the
   whole-number-is-int rule exists in sdk-node only because JavaScript has one number type.
+- **Queued `identify`.** `identify` returns at once, like `track`, and identifies are sent in
+  batches with `BatchIdentify`; a server that answers `unimplemented` (one older than
+  `BatchIdentify`) gets one `Identify` call per item for the rest of the client's life. One of
+  those calls failing raises `Batcher::PartialSendError` with how many went before it, so the retry
+  or dead letter covers only the rest. `on_error` receives undeliverable identifies through
+  `Undelivered#identifies`.
+- **Bad session IDs.** A `session_id` that isn't a hyphenated UUID String is ignored with a
+  warning, and the event keeps the client's session instead of being dropped.
+- **Non-finite traits.** A trait holding NaN or Infinity is skipped with a warning, and the rest of
+  the identify still goes out.
 
 And some are Ruby's own:
 
@@ -157,9 +170,16 @@ And some are Ruby's own:
   `max_wait: 0` still sends each event at once, but a retry waits `MIN_RETRY_WAIT`, so a server
   refusing connections isn't retried in a tight loop.
 - **A close that times out reports the chunk in flight.** sdk-go cancels that send; `Net::HTTP`
-  can't be cancelled from another thread, so it goes on in the background, and `close` reports
-  its events before returning, as possibly delivered. The batcher takes one chunk at a time off
-  the buffer for this, so everything else is still there to report.
+  can't be cancelled from another thread, so it goes on in the background, to the chunk's last
+  item on the per-item `Identify` fallback, and `close` reports the chunk before returning, as
+  possibly delivered. The batcher takes one chunk at a time off the buffer for this, so everything
+  else is still there to report. Since `timeout` bounds each request rather than a chunk, a slow
+  server doesn't cut a fallback chunk short as it does in sdk-go.
+- **Waiting from `on_error`.** On a sender thread or a closing one, `flush` and `close` don't wait
+  at all: with two queues, what they would wait for, such as the other queue's sender, may be in
+  `on_error` waiting on them. `Client#close` starts both batchers' closes under one lock before
+  finishing either, so one caller owns both, their drains overlap, and a `close` from `on_error`
+  during it finds both underway and returns.
 - **Braceless keywords.** Ruby passes `track(id, kind, timestamp: t)` and
   `track(id, kind, plan: "pro")` alike, as one Hash, so a key named after an option sets that
   option. Properties passed as an argument of their own, in braces or a variable, are never read
@@ -177,11 +197,11 @@ And some are Ruby's own:
   since a nested Hash is as likely data keyed by ids, and of two keys that come out alike the last
   wins, as in `Hash#merge`. Well-known properties may be keyed by either name
   (`product_id`/`productId`), and location keys likewise (`postal_code`/`postalCode`).
-- **Blocking calls.** `identify` returns once the server answers, and `flush`/`close` wait, with an
-  optional `timeout:` and a boolean result, the Ruby counterparts of awaiting sdk-node's promises.
-  `track`'s `timestamp` option is a `Time`, not epoch milliseconds.
-- **Forks.** A client created before a fork starts empty in the child, with its own sender thread
-  and connections; the sender thread exits when idle and restarts on the next event, so an unused
+- **Blocking calls.** `flush` and `close` wait, with an optional `timeout:` and a boolean result,
+  the Ruby counterparts of awaiting sdk-node's promises. `track`'s `timestamp` option is a `Time`,
+  not epoch milliseconds.
+- **Forks.** A client created before a fork starts empty in the child, with its own sender threads
+  and connections; a sender thread exits when idle and restarts on the next item, so an unused
   client holds no thread.
 - **Timeouts.** `timeout` bounds each phase of a request (connect, write, read) and is sent as
   `Connect-Timeout-Ms`, so the server enforces the overall deadline; a streaming `list` is bounded
@@ -197,10 +217,12 @@ And some are Ruby's own:
   actual validation contract.
 - The batcher is driven through a fake sink; client tests stub the RPC layer, and
   `test/connect_test.rb` runs the SDK against an in-process HTTP server (`TestSupport::FakeServer`),
-  covering the wire format, the API key header, streaming `list`, error mapping and timeouts.
+  covering the wire format, the API key header, streaming `list`, error mapping, timeouts and the
+  `BatchIdentify` fallback on a server that answers it 404.
 - The never-raises contract is asserted through `TestSupport::LogCapture`, standing in for
   sdk-node's console spies.
-- `test_accounts_for_every_event` checks under real concurrency that every event is delivered or
-  dead-lettered exactly once; the fork test needs a platform with `fork`.
+- `test_accounts_for_every_event` and `test_accounts_for_every_item_through_partial_sends` check
+  under real concurrency that every item is delivered or dead-lettered exactly once; the fork test
+  needs a platform with `fork`.
 
 Before opening a PR: `make check`.

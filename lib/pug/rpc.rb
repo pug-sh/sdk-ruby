@@ -17,6 +17,8 @@ module Pug
                      EventsV1::BatchCreateResponse],
       identify: ["sdk.profiles.v1.ProfilesSDKService/Identify", SdkProfilesV1::IdentifyRequest,
                  SdkProfilesV1::IdentifyResponse],
+      batch_identify: ["sdk.profiles.v1.ProfilesSDKService/BatchIdentify", SdkProfilesV1::BatchIdentifyRequest,
+                       SdkProfilesV1::BatchIdentifyResponse],
       profiles_get: ["shared.profiles.v1.ProfilesService/Get", ProfilesV1::GetRequest, ProfilesV1::GetResponse],
       profiles_get_by_external_id: ["shared.profiles.v1.ProfilesService/GetByExternalId",
                                     ProfilesV1::GetByExternalIdRequest, ProfilesV1::GetByExternalIdResponse],
