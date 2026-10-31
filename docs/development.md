@@ -116,7 +116,9 @@ and a name built at runtime (`public_send(:"has_#{name}?")`) is invisible. Minit
 | `make ci`                  | `protos`, `check-codegen`, then `check` (what CI runs)           |
 
 `Pug::VERSION` in `lib/pug/version.rb` is the gem's version and is sent with every event as
-`$sdkVersion`. Bump it together with the release tag (`vX.Y.Z`).
+`$sdkVersion`. Bump it together with the release tag (`vX.Y.Z`): pushing the tag runs
+`.github/workflows/release.yml`, which checks the tag matches `Pug::VERSION`, runs `make ci` and
+pushes the gem to RubyGems through trusted publishing.
 
 ## Source layout
 

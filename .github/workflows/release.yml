@@ -1,0 +1,76 @@
+name: Release
+
+# Pushing a version tag (v0.1.1) checks the tagged commit as CI does and builds it, then pushes that
+# gem to RubyGems, which cannot be undone.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check and build the tagged commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      # gem build uses Pug::VERSION, whatever the tag says.
+      - name: Check the tag matches Pug::VERSION
+        run: |
+          version="$(ruby -r ./lib/pug/version -e 'print Pug::VERSION')"
+          test "$GITHUB_REF_NAME" = "v$version" \
+            || { echo "::error::Tag $GITHUB_REF_NAME does not match Pug::VERSION $version"; exit 1; }
+
+      - uses: bufbuild/buf-setup-action@v1.50.0
+        with:
+          version: 1.73.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install protoc
+        run: |
+          version=$(sed -n 's/^PROTOC_VERSION *:= *//p' Makefile)
+          curl -fsSL -o protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${version}/protoc-${version}-linux-x86_64.zip"
+          sudo unzip -q -o protoc.zip -d /usr/local bin/protoc 'include/*'
+          rm protoc.zip
+
+      - run: make ci
+
+      - name: Check for uncommitted changes
+        run: git diff --exit-code
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gem
+          path: pug-sh-*.gem
+          if-no-files-found: error
+
+  # A job of its own that installs no bundle, so no dependency's code runs beside the OIDC token.
+  publish:
+    name: Push to RubyGems
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # trusted publishing
+    steps:
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: gem
+          path: ${{ runner.temp }}/gem
+
+      # Pinned to a commit, since a third-party action's tags can be moved.
+      - uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+
+      - run: gem push "$RUNNER_TEMP"/gem/*.gem
