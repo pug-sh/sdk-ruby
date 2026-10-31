@@ -6,7 +6,7 @@ Gem::Specification.new do |spec|
   spec.name = "pug-sh"
   spec.version = Pug::VERSION
   spec.authors = ["pug.sh"]
-  spec.summary = "Pug server-side SDK for Ruby — event tracking, profile identify, and analytics reads."
+  spec.summary = "Pug server-side SDK for Ruby: event tracking, profile identify, and analytics reads."
   spec.homepage = "https://pug.sh"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.3"

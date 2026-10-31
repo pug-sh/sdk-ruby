@@ -13,6 +13,7 @@ class ConnectTest < Minitest::Test
   EventsV1 = Pug::Proto::Sdk::Events::V1
   ProfilesV1 = Pug::Proto::Shared::Profiles::V1
   ActivityV1 = Pug::Proto::Shared::Activity::V1
+  SdkProfilesV1 = Pug::Proto::Sdk::Profiles::V1
   PROTO = { "Content-Type" => "application/proto" }.freeze
   STREAM = { "Content-Type" => "application/connect+proto" }.freeze
   JSON_TYPE = { "Content-Type" => "application/json" }.freeze
@@ -66,13 +67,38 @@ class ConnectTest < Minitest::Test
   end
 
   def test_identify
-    serve { [200, PROTO, ""] }
-    client.identify("user_42", { plan: "pro" }, anonymous_id: "anon-7")
+    serve { ok(SdkProfilesV1::BatchIdentifyResponse.new(accepted: 2)) }
+    pug = client
+    pug.identify("user_42", { plan: "pro" }, anonymous_id: "anon-7")
+    pug.identify("user_43")
+    assert pug.close(timeout: 5)
     request = @server.next_request
-    assert_equal "/sdk.profiles.v1.ProfilesSDKService/Identify", request.path
-    identify = Pug::Proto::Sdk::Profiles::V1::IdentifyRequest.decode(request.body)
-    assert_equal ["user_42", "anon-7", { "plan" => "pro" }],
-                 [identify.external_id, identify.anonymous_id, identify.traits.to_h]
+    assert_equal "/sdk.profiles.v1.ProfilesSDKService/BatchIdentify", request.path
+    assert_equal "prv_test", request.headers["x-api-key"]
+    first, second = SdkProfilesV1::BatchIdentifyRequest.decode(request.body).identifies
+    assert_equal ["user_42", "anon-7", { "plan" => "pro" }], [first.external_id, first.anonymous_id, first.traits.to_h]
+    assert_equal "user_43", second.external_id
+    assert_empty @server.requests
+    assert_empty logs.errors
+  end
+
+  def test_identify_on_a_server_without_batch_identify
+    serve do |request|
+      next [200, PROTO, ""] unless request.path.end_with?("/BatchIdentify")
+
+      [404, { "Content-Type" => "text/plain" }, "404 page not found"]
+    end
+    pug = client
+    pug.identify("user_1")
+    pug.identify("user_2")
+    pug.flush(timeout: 5)
+    pug.identify("user_3")
+    assert pug.close(timeout: 5)
+    requests = @server.requests
+    assert_equal(%w[BatchIdentify Identify Identify Identify], requests.map { |request| request.path.split("/").last })
+    assert_equal(%w[user_1 user_2 user_3],
+                 requests.drop(1).map { |request| SdkProfilesV1::IdentifyRequest.decode(request.body).external_id })
+    assert_equal ["[Pug SDK] Server has no BatchIdentify; sending identifies one at a time."], logs.warnings
     assert_empty logs.errors
   end
 
@@ -379,13 +405,13 @@ class ConnectTest < Minitest::Test
   def test_a_permanent_failure_dead_letters
     serve { error_json(400, "invalid_argument", "bad event") }
     failures = Queue.new
-    pug = client(on_error: ->(error, events) { failures << [error, events] })
+    pug = client(on_error: ->(error, lost) { failures << [error, lost] })
     pug.track("u", "my.custom")
     pug.flush(timeout: 5)
-    error, events = failures.pop(timeout: 5)
+    error, lost = failures.pop(timeout: 5)
     assert_equal :invalid_argument, error.code
-    assert_equal 1, events.size
-    assert_match(/Permanent error, 1 event\(s\) dropped/, logs.errors.last)
+    assert_equal 1, lost.events.size
+    assert_match(/Permanent error, 1 event dropped/, logs.errors.last)
   end
 
   def test_a_transient_failure_retries
@@ -394,7 +420,7 @@ class ConnectTest < Minitest::Test
     pug = client
     pug.track("u", "my.custom")
     pug.flush(timeout: 5)
-    assert_match(/Transient error sending batch, will retry/, logs.warnings.last)
+    assert_match(/Transient error sending 1 event, will retry/, logs.warnings.last)
     pug.flush(timeout: 5)
     first, second = @server.requests
     assert_equal first.body, second.body

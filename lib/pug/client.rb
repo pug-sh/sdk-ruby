@@ -13,12 +13,20 @@ require_relative "rpc"
 require_relative "validator"
 
 module Pug
+  # What one failure lost, as on_error receives it. Either list may be empty.
+  Undelivered = Data.define(:events, :identifies) do
+    def initialize(events: [], identifies: []) = super
+  end
+
   class Client
     DEFAULT_ENDPOINT = "https://api.pugs.dev"
     DEFAULT_TIMEOUT = 10
     RESERVED_PREFIX = "cookieless-"
     TRACK_OPTIONS = %w[timestamp session_id location].freeze
     IDENTIFY_OPTIONS = %w[anonymous_id device_id].freeze
+
+    # Each identify is one NATS message, capped at 1 MiB; the margin covers envelope and headers.
+    MAX_IDENTIFY_BYTES = 900 * 1024
 
     class NotSerializable < StandardError; end
     OMITTED = Object.new.freeze
@@ -39,7 +47,7 @@ module Pug
       end
       raise ArgumentError, "[Pug SDK] on_error must be callable" unless on_error.nil? || on_error.respond_to?(:call)
       unless on_error.nil? || takes_two?(on_error)
-        raise ArgumentError, "[Pug SDK] on_error must take two arguments, (error, events)"
+        raise ArgumentError, "[Pug SDK] on_error must take two arguments, (error, undelivered)"
       end
       raise ArgumentError, "[Pug SDK] batch must be a Hash" unless batch.nil? || batch.is_a?(Hash)
       unless logger.nil? || %i[warn error].all? { |level| logger.respond_to?(level) }
@@ -56,7 +64,14 @@ module Pug
       @connect = Connect.new(endpoint, api_key, timeout: resolve_timeout(timeout))
       @rpc = RPC.new(@connect)
       @events = EventBuilder.new(@log)
-      @batcher = Batcher.new(method(:send_batch), batch, on_error, @log)
+      # Resolved once, so a bad setting warns once rather than once per queue.
+      batch = Batcher.resolve(batch, @log)
+      on_events = on_error && ->(error, events) { on_error.call(error, Undelivered.new(events:)) }
+      on_identifies = on_error && ->(error, identifies) { on_error.call(error, Undelivered.new(identifies:)) }
+      @event_queue = Batcher.new(method(:send_events), batch, on_events, @log)
+      @identify_queue = Batcher.new(method(:send_identifies), batch, on_identifies, @log, noun: Batcher::IDENTIFIES)
+      @close_lock = Mutex.new
+      @unbatched = false
       @session_id = SecureRandom.uuid_v7
       @closed = false
       @profiles = Profiles.new(@rpc)
@@ -78,13 +93,9 @@ module Pug
       properties, options = split_options(properties, options, keywords, TRACK_OPTIONS, "track")
       return @log.error("track() properties must be a Hash.") unless properties.nil? || properties.is_a?(Hash)
 
-      session_id = options["session_id"]
-      return @log.error("track() session_id must be a String.") unless session_id.nil? || session_id.is_a?(String)
-
-      session_id = @session_id if session_id.nil? || session_id.empty?
-      event, bytesize = @events.build(kind, session_id, distinct_id, properties,
+      event, bytesize = @events.build(kind, session(options["session_id"]), distinct_id, properties,
                                       timestamp: options["timestamp"], location: options["location"])
-      @batcher.enqueue(event, bytesize) if event
+      @event_queue.enqueue(event, bytesize) if event
       nil
     rescue StandardError => e
       @log.error("Unexpected error in track(#{kind.inspect}): #{Log.describe(e)}")
@@ -105,36 +116,80 @@ module Pug
       violations = Validator.validate(request)
       return @log.error("Invalid identify request: #{Validator.format(violations)}") unless violations.empty?
 
-      @rpc.unary(:identify, request)
+      bytesize = RPC::SdkProfilesV1::IdentifyRequest.encode(request).bytesize
+      if bytesize > MAX_IDENTIFY_BYTES
+        return @log.error("Identify #{external_id.inspect} dropped: #{bytesize} bytes is too large to send " \
+                          "(limit #{MAX_IDENTIFY_BYTES})")
+      end
+
+      @identify_queue.enqueue(request, bytesize)
       nil
     rescue NotSerializable => e
       @log.error("identify() traits must be JSON-serializable: #{e.message}")
     rescue StandardError => e
-      @log.error("Failed to identify #{external_id.inspect}: #{Log.describe(e)}")
+      @log.error("Unexpected error in identify(#{external_id.inspect}): #{Log.describe(e)}")
     end
 
     def flush(timeout: nil)
-      @batcher.flush(timeout: wait_timeout(timeout, "flush"))
+      deadline = wait_deadline(timeout, "flush")
+      waiters = queues.map(&:request_flush)
+      waiters.map { |waiter| !waiter.pop(timeout: remaining(deadline)).nil? }.all?
     end
 
+    # Concurrent closes can't each own one queue: the second waits on the first's timeout.
     def close(timeout: nil)
       @closed = true
-      @batcher.close(timeout: wait_timeout(timeout, "close"))
+      deadline = wait_deadline(timeout, "close")
+      firsts = @close_lock.synchronize { queues.map(&:start_close) }
+      queues.zip(firsts).map { |queue, first| queue.finish_close(first, deadline) }.all?
     ensure
       @connect.close
     end
 
-    # The default would print the API key and every buffered event.
+    # The default would print the API key and everything queued.
     def inspect = "#<#{self.class.name}>"
 
     private
 
-    def send_batch(events)
+    def send_events(events)
       response = @rpc.unary(:batch_create, RPC::EventsV1::BatchCreateRequest.new(events: events))
       # A refused event isn't an RPC error, so this is the only sign it was lost.
       return unless response.dropped.positive?
 
       @log.warn("Server dropped #{response.dropped} of #{events.size} event(s): #{response.dropped_by_reason.to_h}")
+    end
+
+    # Falls back to one Identify per item on servers older than BatchIdentify.
+    def send_identifies(identifies)
+      return if !@unbatched && batch_identify(identifies)
+
+      identifies.each_with_index do |identify, sent|
+        @rpc.unary(:identify, identify)
+      rescue StandardError => e
+        raise Batcher::PartialSendError.new(sent), cause: e
+      end
+    end
+
+    def batch_identify(identifies)
+      @rpc.unary(:batch_identify, RPC::SdkProfilesV1::BatchIdentifyRequest.new(identifies: identifies))
+      true
+    rescue Error => e
+      # A server without the route answers 404, which the batcher would treat as permanent.
+      raise unless e.code == :unimplemented
+
+      @log.warn("Server has no BatchIdentify; sending identifies one at a time.")
+      @unbatched = true
+      false
+    end
+
+    # A bad session id costs the event its own session, not the event.
+    def session(session_id)
+      return @session_id if session_id.nil? || session_id == ""
+      return session_id if session_id.is_a?(String) && session_id.ascii_only? && Validator::UUID.match?(session_id)
+
+      @log.warn("Ignoring invalid track session_id #{session_id.inspect}; expected a UUID String. " \
+                "Using the client's session.")
+      @session_id
     end
 
     def identify_request(external_id, traits, options)
@@ -157,6 +212,15 @@ module Pug
       DEFAULT_TIMEOUT
     end
 
+    def queues = [@event_queue, @identify_queue]
+
+    # From on_error, waiting could deadlock on the other queue's sender, itself in on_error.
+    def wait_deadline(timeout, method)
+      timeout = wait_timeout(timeout, method)
+      timeout = 0 if queues.any? { |queue| queue.sender? || queue.closing? }
+      timeout && (monotonic + timeout)
+    end
+
     # A timeout that isn't a number waits without one, as close must still drain; one already
     # past doesn't wait at all.
     def wait_timeout(timeout, method)
@@ -165,6 +229,14 @@ module Pug
 
       @log.warn("#{method}() timeout must be a number of seconds; waiting without one.")
       nil
+    end
+
+    def remaining(deadline)
+      deadline && [deadline - monotonic, 0].max
+    end
+
+    def monotonic
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 
     # Lambdas and methods check their arity, so one taking fewer arguments would fail every call.
@@ -235,14 +307,31 @@ module Pug
       end
     end
 
-    # A JSON round trip accepts what JSON does (symbol keys, nested arrays) and refuses what a
-    # Struct can't carry, such as NaN. A Struct's numbers are doubles, so an integer past 2^53
-    # would arrive changed.
+    # A Struct's numbers are doubles, so an integer past 2^53 would arrive changed.
     def to_struct(traits)
       ready = EventBuilder.json_ready(camel_case_keys(traits), max_integer: EventBuilder::MAX_SAFE_FLOAT)
-      ::Google::Protobuf::Struct.from_hash(JSON.parse(JSON.generate(ready)))
+      ::Google::Protobuf::Struct.from_hash(JSON.parse(JSON.generate(finite_traits(ready))))
     rescue StandardError => e
       raise NotSerializable, e.message
+    end
+
+    # JSON has no NaN or Infinity, so a trait holding one costs only itself.
+    def finite_traits(traits)
+      traits.reject do |key, value|
+        next false if finite_json?(value)
+
+        @log.warn("identify() trait #{key.inspect} is not representable (NaN or Infinity), skipping")
+        true
+      end
+    end
+
+    def finite_json?(value)
+      case value
+      when Float then value.finite?
+      when Hash then value.each_value.all? { |item| finite_json?(item) }
+      when Array then value.all? { |item| finite_json?(item) }
+      else true
+      end
     end
 
     # Only the top level, as for properties: a nested Hash is as likely data keyed by ids.

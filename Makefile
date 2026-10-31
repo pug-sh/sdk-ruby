@@ -13,7 +13,7 @@
 # never touch BSR (proto/ + lib/pug/gen are committed). To bump: run `make proto-latest` for the
 # newest commit, set PROTO_COMMIT below, then `make sync-protos && make protos` and review the diff.
 PROTO_MODULE  := buf.build/pugsh/pug
-PROTO_COMMIT  := 8b5d0680b10c4693b4d9d15d3dbfc663
+PROTO_COMMIT  := 35d2a94a2a654a45a773e9184e3f6324
 
 # The Ruby generator is built into protoc, so only this exact protoc reproduces lib/pug/gen.
 PROTOC_VERSION := 36.1

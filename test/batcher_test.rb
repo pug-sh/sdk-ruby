@@ -55,7 +55,7 @@ class BatcherTest < Minitest::Test
       b.enqueue(1, 1)
       b.flush(timeout: 5)
       assert_equal [[error, [1]]], drain(@errors)
-      assert_match(/Permanent error, 1 event\(s\) dropped/, logs.errors.last)
+      assert_match(/Permanent error, 1 event dropped/, logs.errors.last)
       b.close(timeout: 5)
     end
   end
@@ -147,6 +147,48 @@ class BatcherTest < Minitest::Test
     assert_match(/unknown batch option :extra/, logs.warnings.first)
   end
 
+  def test_a_resolved_config_resolves_to_itself_without_a_warning
+    resolved = Pug::Batcher.resolve({ max_size: 5000, "max_wait" => 0.5, max_queue_size: 0 }, Pug::Log.new(logs))
+    assert_equal({ max_size: 1000, max_wait: 0.5, max_queue_size: 10_000 }, resolved)
+    logs.clear
+    b = batcher(resolved)
+    assert_equal [1000, 0.5, 10_000], [b.max_size, b.max_wait, b.max_queue_size]
+    assert_empty logs.warnings
+  end
+
+  def test_names_what_it_carries_in_its_logs
+    b = @batcher = Pug::Batcher.new(->(_) { raise Pug::Error.new("bad", code: :invalid_argument) }, nil, nil,
+                                    Pug::Log.new(logs), noun: Pug::Batcher::IDENTIFIES)
+    2.times { |i| b.enqueue(i, 1) }
+    b.flush(timeout: 5)
+    assert_match(/Permanent error, 2 identifies dropped/, logs.errors.last)
+  end
+
+  def test_retries_only_what_a_partial_send_did_not_deliver
+    calls = 0
+    b = batcher(max_size: 99, max_wait: 60, max_queue_size: 99) do |items|
+      calls += 1
+      @sent << items
+      raise Pug::Batcher::PartialSendError.new(2), cause: TRANSIENT if calls == 1
+    end
+    (1..3).each { |i| b.enqueue(i, 1) }
+    b.flush(timeout: 5)
+    assert_match(/Transient error sending 1 event, will retry/, logs.warnings.last)
+    b.flush(timeout: 5)
+    assert_equal [[1, 2, 3], [3]], drain(@sent)
+    assert_empty drain(@errors)
+  end
+
+  def test_dead_letters_only_what_a_partial_send_did_not_deliver
+    permanent = Pug::Error.new("bad", code: :invalid_argument)
+    b = batcher(max_size: 99, max_wait: 60, max_queue_size: 99) do |_|
+      raise Pug::Batcher::PartialSendError.new(1), cause: permanent
+    end
+    (1..3).each { |i| b.enqueue(i, 1) }
+    b.flush(timeout: 5)
+    assert_equal [[permanent, [2, 3]]], drain(@errors)
+  end
+
   def test_accepts_string_keys_and_a_zero_max_wait
     b = batcher("max_size" => 7, "max_wait" => 0, "max_queue_size" => 9)
     assert_equal [7, 0, 9], [b.max_size, b.max_wait, b.max_queue_size]
@@ -165,7 +207,7 @@ class BatcherTest < Minitest::Test
     b.close(timeout: 5)
     errors = drain(@errors)
     assert_equal [[TRANSIENT, [1]]], errors
-    assert_match(/Client closed, 1 event\(s\) dropped after transient error/, logs.errors.last)
+    assert_match(/Client closed, 1 event dropped after transient error/, logs.errors.last)
   end
 
   def test_stops_at_the_first_transient_failure_and_keeps_order
@@ -308,9 +350,9 @@ class BatcherTest < Minitest::Test
     refute b.close(timeout: 0.1)
     in_flight, unsent = drain(@errors)
     assert_equal [Pug::ClosedError, [1, 2]], [in_flight.first.class, in_flight.last]
-    assert_match(/close timed out with 2 event\(s\) still being sent/, in_flight.first.message)
+    assert_match(/close timed out with 2 events still being sent/, in_flight.first.message)
     assert_equal [Pug::ClosedError, [3, 4, 5]], [unsent.first.class, unsent.last]
-    assert_match(/Client closed with 3 undelivered event\(s\), dropped/, logs.errors.last)
+    assert_match(/Client closed with 3 undelivered events, dropped/, logs.errors.last)
     gate << :go
     assert_equal [1, 2], @sent.pop(timeout: 5)
     wait_until { !b.instance_variable_get(:@thread).alive? }
@@ -338,7 +380,7 @@ class BatcherTest < Minitest::Test
     b = @batcher = Pug::Batcher.new(->(_) { raise TRANSIENT }, { max_size: 2 }, nil, Pug::Log.new(logs))
     3.times { |i| b.enqueue(i, 1) }
     b.close(timeout: 5)
-    assert_includes logs.errors, "[Pug SDK] Client closed with 1 undelivered event(s), dropped"
+    assert_includes logs.errors, "[Pug SDK] Client closed with 1 undelivered event, dropped"
   end
 
   def test_flush_honors_its_timeout
@@ -403,7 +445,7 @@ class BatcherTest < Minitest::Test
                            ->(*) { raise error_class, "callback boom" }, Pug::Log.new(logs))
       b.enqueue(1, 1)
       b.enqueue(2, 1)
-      assert_match(/on_error callback raised; 1 event\(s\) may be lost: #{error_class}/, logs.errors.last)
+      assert_match(/on_error callback raised; 1 event may be lost: #{error_class}/, logs.errors.last)
       b.close(timeout: 5)
     end
   end
@@ -453,6 +495,25 @@ class BatcherTest < Minitest::Test
     b.close(timeout: 10)
     failed = drain(@errors).flat_map(&:last)
     seen = drain(delivered) + failed
+    assert_equal 1600, seen.size
+    assert_equal seen.uniq.size, seen.size
+  end
+
+  def test_accounts_for_every_item_through_partial_sends
+    delivered = Queue.new
+    b = batcher(max_size: 7, max_wait: 0.001, max_queue_size: 50) do |items|
+      items.each_with_index do |item, sent|
+        if rand < 0.05
+          raise Pug::Batcher::PartialSendError.new(sent),
+                cause: [TRANSIENT, Pug::Error.new("bad", code: :invalid_argument)].sample
+        end
+        delivered << item
+      end
+    end
+    threads = Array.new(8) { |t| Thread.new { 200.times { |i| b.enqueue((t * 1000) + i, 1) } } }
+    threads.each(&:join)
+    b.close(timeout: 10)
+    seen = drain(delivered) + drain(@errors).flat_map(&:last)
     assert_equal 1600, seen.size
     assert_equal seen.uniq.size, seen.size
   end
