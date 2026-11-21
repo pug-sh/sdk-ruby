@@ -6,8 +6,11 @@ Gem::Specification.new do |spec|
   spec.name = "pug-sh"
   spec.version = Pug::VERSION
   spec.authors = ["pug.sh"]
-  spec.summary = "Open-source product analytics SDK for Ruby and Rails: server-side event tracking, profile identify, and analytics reads."
-  spec.description = "Tracks events and identifies profiles from Rails or plain Ruby without blocking or raising: background threads send them in batches, and one client is thread- and fork-safe under Puma, Unicorn and Sidekiq. It also reads profiles, activity and insights."
+  spec.summary = "Open-source product analytics SDK for Ruby and Rails: server-side event tracking, " \
+                 "profile identify, and analytics reads."
+  spec.description = "Tracks events and identifies profiles from Rails or plain Ruby without raising: " \
+                     "background threads send them in batches, and one client is thread- and fork-safe under " \
+                     "Puma, Unicorn and Sidekiq. It also reads profiles, activity and insights."
   spec.homepage = "https://pug.sh/integrations/rails"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.3"
