@@ -32,7 +32,7 @@ pug.track("user_42", "order.completed", amount: 49.0, currency: "USD")
 # Well-known events get their properties type-checked and validated against the event's schema.
 pug.track("user_42", "feature_used", feature_id: "export")
 
-# Identify a profile. Like track, it returns at once: identifies are queued and sent in batches.
+# Identify a profile. Like track, it never waits on the network: identifies are batched too.
 pug.identify("user_42", email: "ada@example.com", plan: "pro")
 
 # Reads raise Pug::Error.
@@ -51,7 +51,7 @@ pug.close
 ## Behaviour
 
 - **Ingestion never raises.** `track` and `identify` validate input client-side and log and drop
-  anything invalid. Both are non-blocking: background threads, one for events and one for
+  anything invalid. Neither waits on the network: background threads, one for events and one for
   identifies, send them in batches, by size (`max_size`) or interval (`max_wait`). Identifies go
   out with `BatchIdentify`; a server that predates it gets one `Identify` call each.
 - **Delivery is best-effort with retry.** A transient send failure keeps events and identifies
@@ -108,9 +108,10 @@ blocking the thread that called `track` or `identify`.
 
 ### Ingestion (never raises)
 
-- `pug.track(distinct_id, kind, properties = nil, options = nil)`: enqueue an event. Non-blocking.
+- `pug.track(distinct_id, kind, properties = nil, options = nil)`: enqueue an event. Never waits
+  on the network.
 - `pug.identify(external_id, traits = nil, options = nil)`: enqueue a create-or-update of a
-  profile; its traits are shallow-merged into the stored ones. Non-blocking.
+  profile; its traits are shallow-merged into the stored ones. Never waits on the network.
 - `pug.flush(timeout: nil)`: send the queued events and identifies now and wait for that attempt.
   Returns `false` if `timeout` (seconds) passed first. `true` means the attempt finished, not that
   everything was delivered: a transient failure keeps it queued for a retry.
