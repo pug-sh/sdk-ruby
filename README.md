@@ -4,7 +4,8 @@
 
 # pug-sh
 
-Pug server-side SDK for Ruby: event tracking, profile identify, and analytics reads.
+Open-source product analytics SDK for Ruby and Rails, from [Pug](https://pug.sh): server-side event
+tracking, profile identify, and reads of profiles, activity, and insights.
 
 It is instance-based and authenticates with a **private** project API key (`prv_…`). Ingestion
 never raises, so a tracking call can't take down your request path.
