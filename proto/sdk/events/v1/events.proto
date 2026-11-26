@@ -12,22 +12,13 @@ service EventsService {
 }
 
 message BatchCreateRequest {
-  // SDK-boundary rules only. The internal EventBatch envelope re-validates
-  // Event (see event.identity_required_unless_cookieless) but deliberately not
-  // these two: after ingest resolution the server has legitimately filled the
-  // identity fields of cookieless events with 'cookieless-'-prefixed ids.
-  option (buf.validate.message).cel = {
-    id: "batch.cookieless_identity_server_owned"
-    message: "cookieless events must not send distinct_id or session_id"
-    expression: "this.events.all(e, !e.cookieless || (e.distinct_id == '' && e.session_id == ''))"
-  };
-  option (buf.validate.message).cel = {
-    id: "batch.distinct_id_reserved_prefix"
-    message: "distinct_id must not start with the reserved 'cookieless-' prefix"
-    expression: "this.events.all(e, !e.distinct_id.startsWith('cookieless-'))"
-  };
-
-  repeated Event events = 1 [(buf.validate.field).repeated.max_items = 1000];
+  // BatchCreate validates each event on its own, as an IncomingEvent, so an
+  // event that breaks a rule, or repeats an earlier kept event's event_id, is
+  // dropped as invalid_event and the rest are kept.
+  repeated Event events = 1 [(buf.validate.field).repeated = {
+    max_items: 1000
+    items: {ignore: IGNORE_ALWAYS}
+  }];
 }
 
 message BatchCreateResponse {
@@ -43,8 +34,78 @@ message BatchCreateResponse {
   // Per-reason breakdown of `dropped`, keyed by a stable reason token. This is
   // what makes a drop actionable rather than merely visible: `salt_unavailable`
   // is a server-side fault and the same payload may be retried, whereas
-  // `day_out_of_range` is client clock skew that will drop again on every retry.
+  // `day_out_of_range` is client clock skew and `invalid_event` an event that
+  // broke a validation rule or repeated an earlier kept event's event_id, and
+  // both drop again on every retry.
   map<string, uint32> dropped_by_reason = 3;
+
+  // The events dropped as `invalid_event`, in request order.
+  repeated InvalidEvent invalid_events = 4;
+}
+
+message InvalidEvent {
+  // Position in BatchCreateRequest.events, counting from 0.
+  uint32 index = 1;
+  // The rules it broke, e.g. "event.kind: does not match regex pattern `^[a-zA-Z0-9_.-]+$`".
+  // At most 10, then one more entry that counts the rest, e.g. "and 3 more".
+  repeated string violations = 2;
+}
+
+// Never sent. BatchCreate validates each event as one: Event's rules plus those
+// that hold only at the SDK boundary, since the server fills a cookieless or
+// crawler_request event's identity, with 'cookieless-' or 'crawler-' ids,
+// before the EventBatch envelope re-validates it.
+message IncomingEvent {
+  Event event = 1 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).cel = {
+      id: "incoming_event.cookieless_identity_server_owned"
+      message: "cookieless events must not send distinct_id or session_id"
+      expression: "!this.cookieless || (this.distinct_id == '' && this.session_id == '')"
+    },
+    (buf.validate.field).cel = {
+      id: "incoming_event.distinct_id_reserved_prefix"
+      message: "distinct_id must not start with the reserved 'cookieless-' prefix"
+      expression: "!this.distinct_id.startsWith('cookieless-')"
+    },
+    (buf.validate.field).cel = {
+      id: "incoming_event.distinct_id_reserved_crawler_prefix"
+      message: "distinct_id must not start with the reserved 'crawler-' prefix"
+      expression: "!this.distinct_id.startsWith('crawler-')"
+    },
+    (buf.validate.field).cel = {
+      id: "incoming_event.client_only_on_crawler_request"
+      message: "client is accepted only on a crawler_request event"
+      expression: "!has(this.client) || this.kind == 'crawler_request'"
+    },
+    (buf.validate.field).cel = {
+      id: "incoming_event.crawler_request_shape"
+      message: "a crawler_request event needs client and an http or https $url"
+      expression: "this.kind != 'crawler_request' || (has(this.client) && '$url' in this.auto_properties && this.auto_properties['$url'].string_value.matches('^https?://[^/?#]+'))"
+    },
+    (buf.validate.field).cel = {
+      id: "incoming_event.crawler_request_identity_server_owned"
+      message: "crawler_request events must not send distinct_id, session_id or cookieless"
+      expression: "this.kind != 'crawler_request' || (this.distinct_id == '' && this.session_id == '' && !this.cookieless)"
+    }
+  ];
+}
+
+// The requester a customer's server saw. The server checks it and drops it.
+message Client {
+  // Empty when the caller doesn't know it.
+  string ip = 1 [(buf.validate.field).cel = {
+    id: "client.ip"
+    message: "ip must be an IP address"
+    expression: "this == '' || this.isIp()"
+  }];
+  string user_agent = 2 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).string = {
+      min_len: 1
+      max_bytes: 2048
+    }
+  ];
 }
 
 message Event {
@@ -58,14 +119,13 @@ message Event {
     message: "custom_properties keys must not start with '$' (reserved for auto-properties)"
     expression: "this.custom_properties.all(key, !key.startsWith('$'))"
   };
-  // Holds at BOTH validation stages: at the SDK boundary a cookieless event
-  // arrives with empty identity, and in the worker's envelope re-validation it
-  // carries the server-derived identity — either way this rule passes, while a
-  // non-cookieless event without identity fails at both stages.
+  // Holds at BOTH validation stages: a cookieless or crawler_request event
+  // arrives with empty identity and reaches the worker's envelope with the
+  // server's. Any other event without identity fails at both.
   option (buf.validate.message).cel = {
     id: "event.identity_required_unless_cookieless"
-    message: "distinct_id and session_id are required unless cookieless is true"
-    expression: "this.cookieless || (this.distinct_id != '' && this.session_id != '')"
+    message: "distinct_id and session_id are required unless cookieless is true or kind is crawler_request"
+    expression: "this.cookieless || this.kind == 'crawler_request' || (this.distinct_id != '' && this.session_id != '')"
   };
 
   string event_id = 1 [
@@ -74,9 +134,11 @@ message Event {
   ];
   map<string, common.v1.PropertyValue> auto_properties   = 2;
   map<string, common.v1.PropertyValue> custom_properties = 3;
-  // Empty only when cookieless (event.identity_required_unless_cookieless);
-  // never client-settable to a 'cookieless-'-prefixed value
-  // (batch.distinct_id_reserved_prefix).
+  // Empty only when cookieless or a crawler_request
+  // (event.identity_required_unless_cookieless); never client-settable to a
+  // 'cookieless-' or 'crawler-'-prefixed value
+  // (incoming_event.distinct_id_reserved_prefix and
+  // incoming_event.distinct_id_reserved_crawler_prefix).
   string distinct_id = 4;
   // Same character set as common.v1.EventFilter.kind (filters.proto); + requires non-empty at ingest.
   string kind = 5 [(buf.validate.field) = {
@@ -84,13 +146,16 @@ message Event {
     string: {pattern: "^[a-zA-Z0-9_.-]+$"}
   }];
   google.protobuf.Timestamp occur_time = 6 [(buf.validate.field).required = true];
-  // A UUID whenever set; omit entirely in cookieless mode (an explicit "" is
-  // also rejected — set fields must satisfy the uuid rule).
+  // A UUID whenever set; omit entirely in cookieless mode (an explicit "" also
+  // drops the event as invalid_event, since a set field must be a UUID).
   string session_id = 7 [(buf.validate.field).string.uuid = true];
   // Cookieless (no-consent) mode: the client stores nothing on the device and
   // sends no identity; the ingest server derives an ephemeral daily-rotating
   // distinct_id and a stitched session_id. See docs/architecture/ingestion.md.
   bool cookieless = 8;
+  // Only on a crawler_request event, and only from a private key, which a crawler
+  // collector sends from the site's server.
+  Client client = 9;
 }
 
 message EventBatch {
