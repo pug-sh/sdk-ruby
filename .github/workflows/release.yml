@@ -29,8 +29,9 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$version" \
             || { echo "::error::Tag $GITHUB_REF_NAME does not match Pug::VERSION $version"; exit 1; }
 
-      - uses: bufbuild/buf-setup-action@v1.50.0
+      - uses: bufbuild/buf-action@v1.7.0
         with:
+          setup_only: true
           version: 1.73.0
           github_token: ${{ secrets.GITHUB_TOKEN }}
 

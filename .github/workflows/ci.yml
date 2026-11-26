@@ -24,11 +24,11 @@ jobs:
           ruby-version: "3.4"
           bundler-cache: true
 
-      # buf-setup publishes no moving major tag, so this is pinned exactly. It resolves the
-      # download URL through the GitHub API even for a pinned buf version, and unauthenticated
-      # runners share a 60/hr limit, hence the token.
-      - uses: bufbuild/buf-setup-action@v1.50.0
+      # Pinned exactly, as pug's buf-ci pins it. The token authenticates the buf download from
+      # GitHub releases, which unauthenticated runners share a rate limit for.
+      - uses: bufbuild/buf-action@v1.7.0
         with:
+          setup_only: true
           version: 1.73.0
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
